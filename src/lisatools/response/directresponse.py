@@ -711,7 +711,10 @@ class pyResponseTDI(LISAToolsParallelModule):
         self.t_arr_proj = t_arr
         self.t0_arr = t0_arr
         self.y_gw_flat = y_gw
-        self.y_gw_length = self.num_pts
+        # The kernel wrote each link with stride num_inputs_per_source; the TDI
+        # kernel reads y_gw with stride y_gw_length, so the two must agree (they
+        # differ when the waveform is longer than num_pts, e.g. FEW's n + 1).
+        self.y_gw_length = num_inputs_per_source
 
     @property
     def XYZ(self):
@@ -761,7 +764,8 @@ class pyResponseTDI(LISAToolsParallelModule):
             )
         else:
             assert self.t_arr_proj is not None
-            t_arr = self.t_arr_proj
+            # TDI outputs num_pts samples on the first num_pts projection times.
+            t_arr = self.t_arr_proj[: self.num_pts]
 
         self.delayed_links_flat = self.xp.zeros(
             self.batch_size * 3 * self.num_pts, dtype=self.xp.float64
