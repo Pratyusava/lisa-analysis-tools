@@ -231,15 +231,12 @@ class FEWHarmonicTrackModel(LISAToolsParallelModule):
     def phases_and_derivatives(self, m1, m2, a, T_pl, e_f):
         """``(phase, f, fdot, fddot)`` per orbital phase, each ``(2, n_segments)``
         for ``(Phi_phi, Phi_r)``; ``f`` etc. are orbital frequencies (no ``m, n``)."""
-        from few.utils.geodesic import get_separatrix
-
         from ...sources.emri.wdm_direct import _phase_columns
         from ...utils.constants import YRSID_SI
 
         traj = self.traj
         gen = traj.inspiral_generator
-        p_f = gen.func.separatrix_buffer_dist + get_separatrix(a, e_f, 1.0) + 1e-6
-        traj(m1, m2, a, p_f, e_f, 1.0, T=T_pl, integrate_backwards=True, err=self.err)
+        backward_inspiral(traj, m1, m2, a, T_pl, e_f, err=self.err)
 
         tau = T_pl * YRSID_SI - self.t_alpha  # time before plunge
         ok = (tau > 0.0) & (tau < traj.integrator_spline_t.max())
@@ -256,6 +253,22 @@ class FEWHarmonicTrackModel(LISAToolsParallelModule):
         _, f, fdot, fddot = self.phases_and_derivatives(m1, m2, a, T_pl, e_f)
         w = np.array([self.m, self.n])
         return Track(w @ f, w @ fdot, w @ fddot)
+
+
+def backward_inspiral(traj, m1, m2, a, T_pl, e_f, x_f=1.0, err=1e-11):
+    """Integrate a FEW inspiral back ``T_pl`` [yr] from just outside the separatrix.
+
+    Starts at ``p_sep(a, e_f, x_f) + separatrix_buffer_dist + 1e-6`` (as
+    EMRI-Search does) and leaves the trajectory splines on ``traj``.
+
+    Returns:
+        The trajectory tuple ``(t, p, e, x, Phi_phi, Phi_theta, Phi_r)``; its
+        last samples are the initial conditions ``T_pl`` before plunge.
+    """
+    from few.utils.geodesic import get_separatrix
+
+    p_f = traj.inspiral_generator.func.separatrix_buffer_dist + get_separatrix(a, e_f, x_f) + 1e-6
+    return traj(m1, m2, a, p_f, e_f, x_f, T=T_pl, integrate_backwards=True, err=err)
 
 
 def _roll_and_zero(f, shift, xp):

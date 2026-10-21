@@ -8,6 +8,7 @@ plus ``interpax``) and skip otherwise.
 import copy
 import os
 import pickle
+import types
 import unittest
 
 import numpy as np
@@ -60,10 +61,9 @@ def toy_psd():
 def import_emrisearch(module):
     """Import an ``emrisearch`` module or skip. Its ``emri_utils`` imports the
     retired ``fastlisaresponse`` at module level only for the response wrapper,
-    which these tests never touch, so that import is stubbed."""
+    which these tests replace, so that import is stubbed."""
     import importlib
     import sys
-    import types
 
     sys.modules.setdefault("fastlisaresponse", types.SimpleNamespace(ResponseWrapper=None))
     try:
@@ -786,3 +786,105 @@ class SearchTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InjectionTest(unittest.TestCase):
+    """FEWInjector: EMRI-Search parity, SNR scaling, signal on the FEW track.
+
+    Builds one FEW + response generator (~2.3 GiB, ~10 s) shared by the class;
+    the parity test imports ``emrisearch``, which builds one more.
+    """
+
+    T, T_DATA = 0.05, 0.04
+    PARAMS = (1e6, 10.0, 0.9, 0.045, 0.1)
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import few  # noqa: F401
+        except ImportError:  # pragma: no cover
+            raise unittest.SkipTest("few not installed")
+        from lisatools.search.emri import FEWInjector
+
+        data_dir = os.path.join(EMRI_SEARCH_DIR, "src", "emrisearch", "data")
+        path = os.path.join(data_dir, "TDI2_AE_psd.npy")
+        cls.psd = SensitivityPSD.from_file(path) if os.path.exists(path) else None
+        cls.injector = FEWInjector(cls.T, dt=DT)
+        cls.angles = dict(qS=1.0, phiS=0.5, qK=2.0, phiK=0.2, Phi_phi0=0.1, Phi_r0=0.3)
+        if cls.psd is not None:
+            cls.inj = cls.injector(cls.PARAMS, 30.0, cls.psd, angles=cls.angles)
+
+    def setUp(self):
+        if self.psd is None:
+            self.skipTest("EMRI-Search PSD file not found")
+
+    def test_snr_and_distance(self):
+        from lisatools.search.emri import band_snr
+
+        inj = self.inj
+        self.assertEqual(inj.signal.shape, (1, self.injector.n_samples))
+        self.assertAlmostEqual(band_snr(inj.signal, DT, self.psd), 30.0, places=10)
+        # The waveform is linear in 1 / dist: regenerate at the rescaled distance.
+        p = inj.params
+        h = self.injector.waveform(
+            p["m1"], p["m2"], p["a"], p["p0"], p["e0"], p["x0"], p["dist"], p
+        )
+        np.testing.assert_allclose(h, inj.signal, rtol=1e-10, atol=1e-10 * np.abs(h).max())
+
+    def test_statistic_on_track(self):
+        from lisatools.search.emri import FEWHarmonicTrackModel
+
+        data = self.inj.sft_data(T_SFT, noise=False)
+        stat = FresnelStatistic.for_data(data, force_backend="cpu")
+        track = FEWHarmonicTrackModel(data.t_alpha, m=2, n=0)(self.PARAMS)
+        on = stat.evaluate(data.sfts, track)
+        off = stat.evaluate(data.sfts, Track(track.f + 4 / T_SFT, track.fdot, track.fddot))
+        noise_mean = 1.75 * float(stat.mask(track, T_SFT, np).sum())
+        print(f"[injection] m=2 track {on:.1f}, 4 bins off {off:.1f}, noise mean {noise_mean:.1f}")
+        self.assertGreater(on, 3 * noise_mean)
+        self.assertLess(off, 0.05 * on)
+
+    def test_analytic_psd_warns_without_band(self):
+        with self.assertWarnsRegex(UserWarning, "snr_band"):
+            self.injector(self.PARAMS, 30.0, toy_psd(), angles=self.angles)
+
+    def test_pickle_drops_generator(self):
+        clone = pickle.loads(pickle.dumps(self.injector))
+        self.assertIsNone(getattr(clone, "_generator", None))
+        self.assertEqual(clone.n_samples, self.injector.n_samples)
+
+    def test_matches_emrisearch(self):
+        """``generate_emri_signal_and_sfts`` with its (retired) fastlisaresponse
+        generator replaced by the LAT one: same draws, scaling, trimming, SFTs."""
+        emri_utils = import_emrisearch("emri_utils")
+        search_utils = import_emrisearch("search_utils")
+        da_utils = import_emrisearch("da_utils")
+        gen = self.injector.generator
+
+        def response(T, dt):
+            return lambda *args, eps, **_: gen(*args, eps=eps)
+
+        # create_signal also calls few.has_backend, gone from the current FEW.
+        original = emri_utils.get_response_generator, emri_utils.few
+        emri_utils.get_response_generator = response
+        emri_utils.few = types.SimpleNamespace(has_backend=lambda name: False)
+        try:
+            np.random.seed(3)
+            ref = search_utils.generate_emri_signal_and_sfts(
+                np.array([*self.PARAMS, 1.0]), self.T_DATA, T_SFT, DT, 30.0, self.T
+            )
+        finally:
+            emri_utils.get_response_generator, emri_utils.few = original
+
+        np.random.seed(3)
+        inj = self.injector(self.PARAMS, 30.0, da_utils.psd, T_data=self.T_DATA)
+        signal = inj.sft_data(T_SFT, noise=False)
+        data = inj.sft_data(T_SFT)  # noise from the global RNG, as EMRI-Search draws it
+
+        for name, value in ref["param_dict"].items():
+            key = {"Tpl": "T_pl", "ef": "e_f"}.get(name, name)
+            if key in inj.params:
+                self.assertAlmostEqual(inj.params[key] / value, 1.0, places=10, msg=name)
+        for got, want in ((signal.sfts[0], ref["signal_sfts"]), (data.sfts[0], ref["data_sfts"])):
+            atol = 1e-9 * np.abs(want).max()
+            np.testing.assert_allclose(got, want.T, rtol=1e-9, atol=atol)
