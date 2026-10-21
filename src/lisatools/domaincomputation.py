@@ -338,7 +338,12 @@ class BaseDomainComputationGroup(LISAToolsParallelModule):
 
 
 class STFTComputationGroup(BaseDomainComputationGroup):
-    """Wraps C++ STFTDomainWrap for batched likelihood computation."""
+    """Wraps C++ STFTDomainWrap for batched likelihood computation.
+
+    ``exact_fresnel=True`` makes the linear-chirp (Fresnel) templates use the
+    double-precision Cephes Fresnel integrals instead of the default rational
+    approximation (A&S 7.3.32-33, ~1e-3 accurate).
+    """
 
     def __init__(
         self,
@@ -347,6 +352,7 @@ class STFTComputationGroup(BaseDomainComputationGroup):
         tdi_type: str = "XYZ",
         force_backend: str = "cpu",
         window_alpha: float = 0.0,
+        exact_fresnel: bool = False,
     ):
         from .domains import STFTSettings
 
@@ -357,6 +363,7 @@ class STFTComputationGroup(BaseDomainComputationGroup):
         super().__init__(acs, split_index, tdi_type, force_backend)
 
         self.window_alpha = window_alpha
+        self.exact_fresnel = exact_fresnel
 
         with self.group_device_context():
             self._create_cpp_domain()
@@ -384,7 +391,11 @@ class STFTComputationGroup(BaseDomainComputationGroup):
 
     def _create_cpp_domain(self):
         self._cpp_domain = self.backend.STFTDomainWrap(*self.domain_args)
-        self._cpp_fresnel = self.backend.STFTFresnelWrap(*self.domain_args[:8], window_alpha=self.window_alpha)
+        self._cpp_fresnel = self.backend.STFTFresnelWrap(
+            *self.domain_args[:8],
+            window_alpha=self.window_alpha,
+            exact_fresnel=self.exact_fresnel,
+        )
 
     @property
     def cpp_fresnel(self):
