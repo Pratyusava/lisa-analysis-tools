@@ -279,6 +279,7 @@ def generate_noise_fd(
     df: float,
     *sensitivity_args: typing.Any,
     func: typing.Optional[typing.Callable] = None,
+    rng: typing.Optional[np.random.Generator] = None,
     **sensitivity_kwargs: typing.Any,
 ) -> np.ndarray[float]:
     """Generate noise directly in the Frequency Domain.
@@ -289,6 +290,7 @@ def generate_noise_fd(
         df: Frequency domain bin size (``1 / (N * dt)``).
         sensitivity_args: Arguments for ``func``.
         func: Function for generating the sensitivity curve as a function of frequency. (default: :func:`lisatools.sensitivity.get_sensivity`)
+        rng: Random generator to draw from (default: NumPy's global ``np.random``).
         sensitivity_kwargs: Keyword arguments for ``func``.
 
     Returns:
@@ -312,8 +314,9 @@ def generate_noise_fd(
 
     norm = 0.5 * (1.0 / df) ** 0.5
     psd = func(freqs, *sensitivity_args, **sensitivity_kwargs)
+    rng = np.random if rng is None else rng
     noise_realization = psd ** (1 / 2) * (
-        np.random.normal(0, norm, len(freqs)) + 1j * np.random.normal(0, norm, len(freqs))
+        rng.normal(0, norm, len(freqs)) + 1j * rng.normal(0, norm, len(freqs))
     )
     return noise_realization
 
