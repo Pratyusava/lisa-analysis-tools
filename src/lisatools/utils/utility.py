@@ -343,13 +343,14 @@ def generate_noise_fd(
     df: float,
     *sensitivity_args: typing.Any,
     func: typing.Optional[typing.Callable] = None,
+    rng: typing.Optional[np.random.Generator] = None,
     **sensitivity_kwargs: typing.Any,
 ) -> np.ndarray[float]:
     """Generate noise directly in the Frequency Domain.
 
     Evaluates the PSD on ``freqs = arange(N) * df`` and returns
     ``sqrt(psd) * (n_re + 1j * n_im)`` with ``n_re``, ``n_im`` drawn from
-    ``N(0, 0.5 / sqrt(df))`` (``np.random``, unseeded here).
+    ``N(0, 0.5 / sqrt(df))`` (from ``rng``, else the global ``np.random``).
 
     Args:
         N: Number of points in frequency domain waveform assuming frequencies greater than
@@ -358,6 +359,7 @@ def generate_noise_fd(
         *sensitivity_args: Positional arguments forwarded to ``func`` after the frequencies.
         func: Function ``func(freqs, *sensitivity_args, **sensitivity_kwargs)`` returning the
             PSD (1/Hz) at each frequency. Pass it explicitly, see Warning.
+        rng: ``np.random.Generator`` to draw from (default: NumPy's global ``np.random``).
         **sensitivity_kwargs: Keyword arguments forwarded to ``func``.
 
     Returns:
@@ -400,8 +402,9 @@ def generate_noise_fd(
 
     norm = 0.5 * (1.0 / df) ** 0.5
     psd = func(freqs, *sensitivity_args, **sensitivity_kwargs)
+    rng = np.random if rng is None else rng
     noise_realization = psd ** (1 / 2) * (
-        np.random.normal(0, norm, len(freqs)) + 1j * np.random.normal(0, norm, len(freqs))
+        rng.normal(0, norm, len(freqs)) + 1j * rng.normal(0, norm, len(freqs))
     )
     return noise_realization
 

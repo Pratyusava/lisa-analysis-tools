@@ -75,21 +75,34 @@ def _check_orbits_jax(*args, **kwargs):
 
 
 def _jax_methods_loader() -> LISAToolsBackendMethods:
-    """Build the JAX backend's method table (``OrbitsWrap``, ``Orbits``, ``check_orbits``, ``xp``).
+    """Build the JAX backend's method table (``OrbitsWrap``, ``Orbits``, ``check_orbits``,
+    ``TDITypeDict``, ``xp``).
 
     Returns:
-        LISAToolsBackendMethods: The table; slots not listed keep their defaults.
+        LISAToolsBackendMethods: The table; every other slot is a stub raising
+        ``NotImplementedError``.
     """
+    import dataclasses
+
     jnp = _check_jax()
     from .orbits import OrbitsWrapJAX
 
-    return LISAToolsBackendMethods(
+    implemented = dict(
         OrbitsWrap=OrbitsWrapJAX,
         Orbits=OrbitsWrapJAX,                          # JAX side: same class
         check_orbits=_check_orbits_jax,
-        # SensitivityMatrixWrap=_unimplemented("SensitivityMatrixWrap"),  # XYZBackend disabled
+        # Canonical TDI flavor ints (domains.hpp: TDI_XYZ=1, TDI_AET=2, TDI_AE=3).
+        TDITypeDict={"XYZ": 1, "AET": 2, "AE": 3},
         xp=jnp,
     )
+    # Every other native slot gets a raising stub, so a field added to
+    # LISAToolsBackendMethods never breaks constructing this backend.
+    stubs = {
+        f.name: _unimplemented(f.name)
+        for f in dataclasses.fields(LISAToolsBackendMethods)
+        if f.name not in implemented
+    }
+    return LISAToolsBackendMethods(**implemented, **stubs)
 
 
 class LISAToolsJaxBackend(Backend, LISAToolsBackend):

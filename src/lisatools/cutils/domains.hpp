@@ -431,15 +431,18 @@ class STFTFresnel : public STFTSettings {
                           ///< window) [s] alpha * dt / 2
   double f_taper;  /// 1.0 / (2.0 * taper_duration);  ///< Frequency scale
                    /// associated with the window taper [Hz]
+  bool exact_fresnel;  ///< true: Cephes fresnl (rel. err ~1e-15); false: the
+                       ///< A&S 7.3.32-33 rational approximation (~1e-3)
   CUDA_CALLABLE_MEMBER
   STFTFresnel(int num_times_, int num_freqs_, int num_channels_, double t0_,
               double f_min_, double f_max_, double dt_, double df_,
-              double window_alpha_)
+              double window_alpha_, bool exact_fresnel_ = false)
       : STFTSettings(num_times_, num_freqs_, num_channels_, t0_, f_min_, f_max_,
                      dt_, df_),
         window_alpha(window_alpha_),
         taper_duration(window_alpha_ > 0.0 ? window_alpha_ * dt_ / 2.0 : 0.0),
-        f_taper(window_alpha_ > 0.0 ? 1.0 / (2.0 * taper_duration) : 0.0){};
+        f_taper(window_alpha_ > 0.0 ? 1.0 / (2.0 * taper_duration) : 0.0),
+        exact_fresnel(exact_fresnel_){};
 
   CUDA_DEVICE
   void get_amp_phase(double* amp, double* phase, cmplx z);
@@ -455,6 +458,10 @@ class STFTFresnel : public STFTSettings {
   void get_fresnel_integrals(double* C, double* S,
                              double x);  // Fresnel integrals C(x) and S(x)
                                          // returned in ints[0] and ints[1]
+  CUDA_DEVICE
+  void get_fresnel_integrals_approx(double* C, double* S, double x);
+  CUDA_DEVICE
+  void get_fresnel_integrals_exact(double* C, double* S, double x);
   CUDA_DEVICE
   cmplx get_fresnel_kernel_interval(double f, double t0, double f0,
                                     double fdot0, double t_start, double t_end);
