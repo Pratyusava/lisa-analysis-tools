@@ -307,10 +307,30 @@ _add(Run(
     ),
 ))
 _add(Run(
-    name="24mo", days=720, parent="18mo",
+    name="24mo", days=720,
+    # ⚠ TEMPORARY (Mike 2026-10-24, the 24mo SMOKE TEST -- "make sure everything
+    # works"): the parent is the LIVE 12mo flagship run (gf_prod_12mo_flagship;
+    # no 18mo run exists yet) and gb_search_seed runs ONE full sampler iteration
+    # instead of the template's three (the GB_SEARCH_SEED_ITERS override).
+    # Everything else is the permanent 24mo: all 20 MBHBs by the two-week rule,
+    # every source (MBHB / SOBHB / EMRI / VGB) at the catalogue injection
+    # (SOURCE_WARM_START_STORE empty since 2026-10-22, *_START_FACTOR=0).
+    # RESTORE AFTER THE TEST: parent="18mo", drop the override, rebuild, and put
+    # tests/test_flagship_launchers.py::ParentChainTest back to "18mo".
+    parent="12mo",                              # permanent value: "18mo"
     gb_nleaves_max=25000, gb_n_subbands=2048, gb_rj_inmodel_chunk=8192,
     edge_crop_wavelets=120,
+    overrides={"GB_SEARCH_SEED_ITERS": "1"},    # TEMPORARY; permanent: none (template = 3)
     notes=(
+        "⚠ TEMPORARY SMOKE-TEST CONFIGURATION (Mike 2026-10-24): PARENT = the LIVE",
+        "12mo flagship run gf_prod_12mo_flagship (no 18mo run exists yet) and",
+        "gb_search_seed = ONE iteration (GB_SEARCH_SEED_ITERS override; 3 in the",
+        "template). Every source (MBHB / SOBHB / EMRI / VGB) starts at the",
+        "catalogue injection (SOURCE_WARM_START_STORE empty, *_START_FACTOR=0);",
+        "all 20 MBHBs are in. While the 12mo job is still WRITING its store,",
+        "launch with GF_SEED_STORE=<12mo dir>/gf_prod_12mo_testing_running_backup_copy.h5",
+        "(README: 'A child whose parent is still running'). Restore parent=\"18mo\"",
+        "and drop the override in runs.py after the test, then rebuild.",
         "All 20 catalogue MBHBs merge inside 720 d (the last, 14, at 712.7 d).",
         "EDGE_CROP 120 (guard needs 95). Same unverified-at-this-Tobs list as the",
         "18mo; the F-stat host-mapped float32 grid (TODO) is the real fix for the",
