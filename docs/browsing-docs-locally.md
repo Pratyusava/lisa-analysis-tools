@@ -34,8 +34,16 @@ Six of the LAT guides (`conventions`, `architecture-map`, `codebase-map`, `globa
 
 ## Build
 
-Use the `deving` environment (Sphinx 9.1, `sphinx_rtd_theme`, `myst_parser`, `nbsphinx`,
-`sphinx-tippy`; the six packages installed editable). The command is the one CI uses, the same in every
+Build in the environment that holds the six packages (autodoc imports them). It needs Sphinx and the
+extensions every `docs/source/conf.py` lists, plus pandoc for the notebook pages:
+
+```bash
+pip install "sphinx>=8" sphinx-rtd-theme myst-parser nbsphinx sphinx-tippy ipython
+brew install pandoc          # or the pandoc installer; nbsphinx calls it
+```
+
+(On the laptop that is the `deving` environment: Sphinx 9.1, sphinx_rtd_theme 3.1, myst-parser 5.1,
+nbsphinx 0.9.8, sphinx-tippy 0.4.3, pandoc 3.10.) The command is the one CI uses, the same in every
 repo. One package:
 
 ```bash
