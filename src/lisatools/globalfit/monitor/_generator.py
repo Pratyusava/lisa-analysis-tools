@@ -3642,38 +3642,10 @@ MOJITO_CAT_DIR = _resolve_mojito_cat_dir()
 
 
 def cat_to_sampled9(entry):
-    """Catalogue columns -> the run's 9-column GB sampling basis + an
-    amplitude self-check.
-
-    Conventions are NEVER re-derived here. The physical->sampling map is
-    ``recipe.gb_catalogue_to_sampling_basis`` (the single source of the
-    phi0 SIGN -- sampling phi0 = -TrueAnomaly mod 2pi -- the ICRS
-    ``alpha``/``sin_delta`` sky frame and the psi mod-pi wrap), and the
-    ``(dist, Mc, fdot_astro_ratio)`` split follows the run's own catalogue
-    path in ``stock/erebor/vgb.py``: ``dist = LuminosityDistance`` (Mpc ->
-    kpc), ``Mc = ChirpMassSSBFrame``, ``r = fdot_cat / fdot_gr(f0, Mc) - 1``.
-    That split reproduces the catalogue Amplitude and fdot EXACTLY (the
-    returned ``rel`` is the amplitude residual, asserted small by the run's
-    own VGB path).
-
-    Returns ``(rows9, rel_max)`` with rows9 columns
-    ``[dist kpc, f0 mHz, Mc, phi0, cos_iota, psi, alpha, sin_delta, ratio]``
-    -- the run's ``key_order`` for the gb branch.
-    """
-    from lisatools.globalfit.recipe import gb_catalogue_to_sampling_basis
-    from lisatools.globalfit.stock.erebor.transforms import (
-        McDistFdotAstroQuad, gb_amp_from_dist)
-    rows = np.atleast_2d(gb_catalogue_to_sampling_basis(entry))
-    d_kpc = np.asarray(entry["LuminosityDistance"], dtype=float).ravel() * 1e3
-    mc = np.asarray(entry["ChirpMassSSBFrame"], dtype=float).ravel()
-    f0_hz = rows[:, 1] * 1e-3
-    _, _, fdot_gr, _ = McDistFdotAstroQuad()(
-        d_kpc, f0_hz, mc, np.zeros_like(d_kpc))
-    ratio = rows[:, 2] / fdot_gr - 1.0
-    rel = float(np.abs(
-        gb_amp_from_dist(f0_hz, mc, d_kpc) / np.exp(rows[:, 0]) - 1.0).max())
-    return np.column_stack([d_kpc, rows[:, 1], mc, rows[:, 3], rows[:, 4],
-                            rows[:, 5], rows[:, 6], rows[:, 7], ratio]), rel
+    """Catalogue columns -> the run's 9-column GB sampling basis + an amplitude self-check:
+    :func:`lisatools.globalfit.stock.erebor.injections.gb_catalogue_to_sampled9`."""
+    from lisatools.globalfit.stock.erebor.injections import gb_catalogue_to_sampled9
+    return gb_catalogue_to_sampled9(entry)
 
 
 VGB_TRUTH = None        # (55, ndim) in the VGB sampled basis (5 or 6 cols)

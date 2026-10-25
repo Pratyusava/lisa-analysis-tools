@@ -2076,3 +2076,170 @@ class ZeroDataProcessingStep(BaseProcessingStep):
         # the settings' orbits (the base pour transforms the zero TD stream).
         self.orbits = None
         self.catalogue = {}
+
+
+# ---------------------------------------------------------------------------
+# catalogue injections in the run's sampling bases (the stock converters)
+# ---------------------------------------------------------------------------
+
+#: branch -> the catalogue class ``L1DataLoader`` reads
+CATALOGUE_CLASS = {"mbh": "MBHB", "sobbh": "SOBHB", "emri": "EMRI", "vgb": "VGB"}
+
+
+def load_catalogue(l1_folder, cls, ids=None):
+    """``({id: params}, catalogue file)`` read the way ``L1DataLoader`` reads it.
+
+    Args:
+        l1_folder (str): The mojito data folder (holds ``catalogues/``).
+        cls (str): Catalogue class: ``"MBHB"``, ``"SOBHB"``, ``"EMRI"``, ``"VGB"`` or ``"GB"``.
+        ids (sequence of int, optional): Catalogue ids to read; ``None`` reads every row.
+            The VGB and GB catalogues are read whole into entry ``0`` (the loader's rule).
+
+    Returns:
+        tuple: ``({id: params dict}, path)``.
+
+    Raises:
+        ValueError: The catalogue file is not under ``l1_folder``.
+    """
+    import h5py
+
+    from lisatools.globalfit.preprocessing import L1DataLoader
+
+    loader = L1DataLoader(l1_folder, source_types=[cls],
+                          source_ids={cls: list(ids) if ids is not None else [0]},
+                          verbose=False)
+    path = os.path.join(loader.catalogues_folder, loader.catalogues_map[cls])
+    if not os.path.exists(path):
+        raise ValueError(
+            f"catalogue file not found: {path}. Point l1_folder at the folder holding "
+            "catalogues/ (the run's L1_folder, or this machine's copy of it).")
+    with h5py.File(path, "r") as f:
+        grp = f["Binaries"]
+        if cls in ("VGB", "GB"):
+            use = [0]
+        else:
+            use = list(ids) if ids is not None else list(range(int(grp["ID"].shape[0])))
+        return {i: loader.load_single_binary(grp, i, cls) for i in use}, path
+
+
+def _vgb_sampling_rows(cat, basis):
+    """``prepare_vgb_branch`` on a light setup: its ``injection``, f0 [mHz], names."""
+    from types import SimpleNamespace
+
+    from lisatools.globalfit.stock.erebor.vgb import (
+        VGBSettings,
+        prepare_vgb_branch,
+        vgb_sampled_basis,
+    )
+    v = VGBSettings()
+    v.injection = None
+    v.sample_distance = basis in ("distance", "chirp")
+    v.chirp_mass_basis = basis == "chirp"
+    gs = SimpleNamespace(catalogue={"VGB": cat}, domain_settings=None, Tobs=31536000.0,
+                         min_freq=0.0, max_freq=1.0, mojito_data_path=None,
+                         tdi_chan="XYZ", force_backend="cpu", ntemps=1)
+    prepare_vgb_branch(v, gs, data_mode="mojito")
+    f0 = np.asarray(v.fixed_params, dtype=float)[:, 0]
+    return np.asarray(v.injection, dtype=float), f0, list(vgb_sampled_basis(v))
+
+
+def catalogue_sampling_rows(branch, cat, *, vgb_basis="chirp"):
+    """``(rows, leaf labels, column names)``: the catalogue in ``branch``'s sampling basis.
+
+    ``rows[j]`` is leaf ``j``: the ``j``-th sorted catalogue id (VGB: the catalogue's file
+    order), converted the way the run converts it (``mbh_catalogue_to_sampling_basis``,
+    the EMRI and SOBBH waveform-basis converters through the stock transforms' inverses,
+    ``prepare_vgb_branch`` for the VGBs).
+
+    Args:
+        branch (str): ``"mbh"``, ``"sobbh"``, ``"emri"`` or ``"vgb"``.
+        cat (dict): ``{id: params}`` from :func:`load_catalogue`.
+        vgb_basis (str): ``"chirp"`` (6 columns, production), ``"distance"`` or ``"legacy"``.
+
+    Returns:
+        tuple: ``(rows (nleaves, ndim), labels, names)``.
+
+    Raises:
+        ValueError: An unknown branch.
+    """
+    from lisatools.globalfit.stock.erebor import transforms as T
+
+    if branch == "vgb":
+        rows, f0, names = _vgb_sampling_rows(cat, vgb_basis)
+        return rows, [f"f0 {x:.6f} mHz" for x in f0], names
+    ids = sorted(cat)
+    labels = [f"id {i}" for i in ids]
+    if branch == "mbh":
+        from lisatools.globalfit.recipe import mbh_catalogue_to_sampling_basis
+
+        rows = np.stack([mbh_catalogue_to_sampling_basis(cat[i]) for i in ids], axis=0)
+        names = list(T.make_mbh_transform_container().input_basis)
+    elif branch == "emri":
+        from lisatools.sources.emri import emri_catalogue_to_waveform_basis
+
+        full = np.asarray([emri_catalogue_to_waveform_basis(cat[i]) for i in ids])
+        tc = T.make_emri_transform_container(full[:, [5, 12]])
+        rows = tc.both_inverse_transforms(full)
+        names = list(tc.input_basis)
+    elif branch == "sobbh":
+        full = np.asarray([sobbh_catalogue_to_waveform_basis(cat[i]) for i in ids])
+        tc = T.make_sobbh_transform_container()
+        rows = np.stack([tc.both_inverse_transforms(r) for r in full], axis=0)
+        names = list(tc.input_basis)
+    else:
+        raise ValueError(f"{branch!r} is not one of {tuple(CATALOGUE_CLASS)}")
+    return np.asarray(rows, dtype=float), labels, names
+
+
+def gb_catalogue_to_sampled9(entry):
+    """Catalogue columns -> the run's 9-column GB sampling basis, with an amplitude check.
+
+    The physical -> sampling map is :func:`~lisatools.globalfit.recipe.gb_catalogue_to_sampling_basis`
+    (the phi0 sign, the ICRS sky, the psi wrap); the ``(dist, Mc, fdot_astro_ratio)`` split
+    follows the run's VGB path: ``dist = LuminosityDistance`` (Mpc -> kpc),
+    ``Mc = ChirpMassSSBFrame``, ``ratio = fdot_cat / fdot_gr(f0, Mc) - 1``, which reproduces the
+    catalogue amplitude and fdot.
+
+    Args:
+        entry (dict): Catalogue columns (arrays of any common length) as the loader returns
+            them: ``Amplitude``, ``GW22FrequencySSBFrame``, ``GW22FrequencyDerivativeSourceFrame``,
+            ``TrueAnomaly``, ``InclinationAngle``, ``PolarisationAngle``, ``RightAscension``,
+            ``Declination``, ``LuminosityDistance``, ``ChirpMassSSBFrame``.
+
+    Returns:
+        tuple: ``(rows (n, 9), rel)`` with the columns ``dist [kpc], f0 [mHz], Mc, phi0,
+        cos_iota, psi, alpha, sin_delta, fdot_astro_ratio`` (the store's ``key_order`` for
+        ``gb``) and the largest relative amplitude residual of the split.
+    """
+    from lisatools.globalfit.recipe import gb_catalogue_to_sampling_basis
+    from lisatools.globalfit.stock.erebor.transforms import McDistFdotAstroQuad, gb_amp_from_dist
+
+    rows = np.atleast_2d(gb_catalogue_to_sampling_basis(entry))
+    d_kpc = np.asarray(entry["LuminosityDistance"], dtype=float).ravel() * 1e3
+    mc = np.asarray(entry["ChirpMassSSBFrame"], dtype=float).ravel()
+    f0_hz = rows[:, 1] * 1e-3
+    _, _, fdot_gr, _ = McDistFdotAstroQuad()(d_kpc, f0_hz, mc, np.zeros_like(d_kpc))
+    ratio = rows[:, 2] / fdot_gr - 1.0
+    rel = float(np.abs(gb_amp_from_dist(f0_hz, mc, d_kpc) / np.exp(rows[:, 0]) - 1.0).max())
+    return np.column_stack([d_kpc, rows[:, 1], mc, rows[:, 3], rows[:, 4], rows[:, 5],
+                            rows[:, 6], rows[:, 7], ratio]), rel
+
+
+def nearest_row(rows, sample, cols):
+    """The index of the row of ``rows`` nearest ``sample`` in the columns ``cols``.
+
+    The distance is the largest relative difference over ``cols``, so one column can pick
+    a source (``t_plunge`` for an MBHB, ``f_low`` for a SOBHB) and several can together.
+
+    Args:
+        rows (np.ndarray): ``(n, ndim)`` candidate rows (a catalogue in the sampling basis).
+        sample (np.ndarray): ``(ndim,)`` the sample to match.
+        cols (sequence of int): The columns compared.
+
+    Returns:
+        int: The row index.
+    """
+    rows, sample = np.asarray(rows, dtype=float), np.asarray(sample, dtype=float)
+    cols = list(cols)
+    d = np.abs(rows[:, cols] - sample[cols]) / np.maximum(np.abs(sample[cols]), 1e-300)
+    return int(np.argmin(d.max(axis=1)))

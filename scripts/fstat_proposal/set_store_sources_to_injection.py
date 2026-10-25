@@ -143,6 +143,8 @@ from types import SimpleNamespace
 import h5py
 import numpy as np
 
+from lisatools.globalfit.stock.erebor import injections as _injections
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import copy_store_leaf as CSL  # noqa: E402  (store layout tables + safety helpers)
 from compact_gf_store import pids_holding, sidecar_paths  # noqa: E402
@@ -233,20 +235,9 @@ def parse_ids(text):
 
 
 def load_catalogue(l1_folder, cls, ids):
-    """``({id: params}, catalogue file)`` read the way ``L1DataLoader`` reads it."""
-    from lisatools.globalfit.preprocessing import L1DataLoader
-
-    loader = L1DataLoader(l1_folder, source_types=[cls], source_ids={cls: list(ids)},
-                          verbose=False)
-    path = os.path.join(loader.catalogues_folder, loader.catalogues_map[cls])
-    if not os.path.exists(path):
-        raise ValueError(
-            f"catalogue file not found: {path}. Point --l1-folder at the folder holding "
-            "catalogues/ (the run's L1_folder, or this machine's copy of it).")
-    use = [0] if cls in ("VGB", "GB") else list(ids)   # the loader's own rule
-    with h5py.File(path, "r") as f:
-        grp = f["Binaries"]
-        return {i: loader.load_single_binary(grp, i, cls) for i in use}, path
+    """``({id: params}, catalogue file)`` read the way ``L1DataLoader`` reads it
+    (:func:`lisatools.globalfit.stock.erebor.injections.load_catalogue`)."""
+    return _injections.load_catalogue(l1_folder, cls, ids)
 
 
 # --------------------------------------------------------------------------
@@ -266,61 +257,12 @@ def vgb_basis_for(ndim, requested="auto"):
         "VGB_SAMPLE_DISTANCE knob).")
 
 
-def _vgb_rows(cat, basis):
-    """``prepare_vgb_branch`` on a light setup: its ``injection``, f0 [mHz], names."""
-    from lisatools.globalfit.stock.erebor.vgb import (
-        VGBSettings,
-        prepare_vgb_branch,
-        vgb_sampled_basis,
-    )
-
-    v = VGBSettings()
-    v.injection = None
-    v.sample_distance = basis in ("distance", "chirp")
-    v.chirp_mass_basis = basis == "chirp"
-    gs = SimpleNamespace(catalogue={"VGB": cat}, domain_settings=None, Tobs=31536000.0,
-                         min_freq=0.0, max_freq=1.0, mojito_data_path=None,
-                         tdi_chan="XYZ", force_backend="cpu", ntemps=1)
-    prepare_vgb_branch(v, gs, data_mode="mojito")
-    f0 = np.asarray(v.fixed_params, dtype=float)[:, 0]
-    return np.asarray(v.injection, dtype=float), f0, list(vgb_sampled_basis(v))
-
-
 def injection_rows(branch, cat, *, vgb_basis=None):
-    """``(rows, leaf labels, column names)`` for ``branch`` from ``cat``.
-
-    ``rows[j]`` is leaf ``j``: the ``j``-th sorted catalogue id (VGB: the
-    catalogue's file order), in the run's sampling basis.
-    """
-    from lisatools.globalfit.stock.erebor import transforms as T
-
-    if branch == "vgb":
-        rows, f0, names = _vgb_rows(cat, vgb_basis)
-        return rows, [f"f0 {x:.6f} mHz" for x in f0], names
-    ids = sorted(cat)
-    labels = [f"id {i}" for i in ids]
-    if branch == "mbh":
-        from lisatools.globalfit.recipe import mbh_catalogue_to_sampling_basis
-
-        rows = np.stack([mbh_catalogue_to_sampling_basis(cat[i]) for i in ids], axis=0)
-        names = list(T.make_mbh_transform_container().input_basis)
-    elif branch == "emri":
-        from lisatools.sources.emri import emri_catalogue_to_waveform_basis
-
-        full = np.asarray([emri_catalogue_to_waveform_basis(cat[i]) for i in ids])
-        tc = T.make_emri_transform_container(full[:, [5, 12]])
-        rows = tc.both_inverse_transforms(full)
-        names = list(tc.input_basis)
-    elif branch == "sobbh":
-        from lisatools.globalfit.stock.erebor.injections import sobbh_catalogue_to_waveform_basis
-
-        full = np.asarray([sobbh_catalogue_to_waveform_basis(cat[i]) for i in ids])
-        tc = T.make_sobbh_transform_container()
-        rows = np.stack([tc.both_inverse_transforms(r) for r in full], axis=0)
-        names = list(tc.input_basis)
-    else:
+    """``(rows, leaf labels, column names)`` for ``branch`` from ``cat``
+    (:func:`lisatools.globalfit.stock.erebor.injections.catalogue_sampling_rows`)."""
+    if branch not in BRANCHES:
         raise ValueError(f"{branch!r} is not one of {BRANCHES}")
-    return np.asarray(rows, dtype=float), labels, names
+    return _injections.catalogue_sampling_rows(branch, cat, vgb_basis=vgb_basis)
 
 
 # --------------------------------------------------------------------------
