@@ -32,22 +32,7 @@
 #   TABLE, CATALOG, ORBITS (auto; equal-arm skips the data), L1_DIR (""), MOJITO_DATA_PATH
 #   (/shared/data/mojito_cache), CHUNKS ("1,2,4,8,16,32"), ROWS (32), GRIDS
 #   ("sparse,pixels"), LOOKUPS ("kernel,python"), BAND ("2.5e-4,2.5e-2"; "" = all layers), EDGE (60),
-#   FOREGROUND (on), NT_SUB (the plunge-chunk length in time layers, or auto / auto:<floor>: one
-#   length per call holding its longest tail in one window; only when NT_SUB or
-#   EMRI_DIRECT_NT_SUB is set is it passed to the stage timing as --nt-sub and exported as
-#   EMRI_DIRECT_NT_SUB for the accuracy step -- unset, the generators keep their own default, 128,
-#   which a short window (Nt < 128, DAYS <= 5) may run with, while a chosen value must be <= Nt;
-#   the stage timing's [split] lines -- printed below -- give the lookup / chunk split of every
-#   timed call, its [walls] lines the phase walls of the batched chunk path per row, its
-#   [parity] lines each batched row against the same row built alone),
-#   TAIL_SKIP_PX (rows whose plunge tail spans at most this many pixels are looked up through
-#   their end instead; same pattern: only when TAIL_SKIP_PX or EMRI_DIRECT_TAIL_SKIP_PX is set is
-#   it passed as --tail-skip-px and exported as EMRI_DIRECT_TAIL_SKIP_PX -- unset, the generators'
-#   default 0 = never skip; the [split] lines count the skipped rows),
-#   CHUNK_BATCH (1: a batch's plunge-chunk rows built in one call, the batched path this test
-#   measures; 0: one per call, the library and global-fit default; passed as --chunk-batch),
-#   WALLS (1: the [walls] phase walls, two device synchronisations per phase; 0: off, to A/B
-#   their cost; passed as --walls),
+#   FOREGROUND (on),
 #   REPS (3), OUT (emri_speed_durations_<date>).
 #
 # Memory: a direct template holds a (3, n_m, Nt) float64 accumulator while it is built: on the
@@ -72,19 +57,6 @@ LOOKUPS=${LOOKUPS:-kernel,python}
 BAND=${BAND-2.5e-4,2.5e-2}
 EDGE=${EDGE:-60}
 FOREGROUND=${FOREGROUND:-on}
-NT_SUB=${NT_SUB:-${EMRI_DIRECT_NT_SUB:-}}  # unset: the generator's own default (128), never a chosen value
-tail_args=()
-if [ -n "${NT_SUB}" ]; then
-  export EMRI_DIRECT_NT_SUB=${NT_SUB}      # the accuracy step's generators read the same length
-  tail_args=(--nt-sub "${NT_SUB}")
-fi
-TAIL_SKIP_PX=${TAIL_SKIP_PX:-${EMRI_DIRECT_TAIL_SKIP_PX:-}}  # unset: the generator's own default (0, never skip)
-if [ -n "${TAIL_SKIP_PX}" ]; then
-  export EMRI_DIRECT_TAIL_SKIP_PX=${TAIL_SKIP_PX}   # the accuracy step's generators read the same threshold
-  tail_args+=(--tail-skip-px "${TAIL_SKIP_PX}")
-fi
-CHUNK_BATCH=${CHUNK_BATCH:-1}               # 1: chunk rows batched (the speed test); 0: one per call (production)
-WALLS=${WALLS:-1}                           # 1: [walls] phase walls (device syncs per phase); 0: off (A/B)
 REPS=${REPS:-3}
 OUT=${OUT:-emri_speed_durations_$(date +%Y%m%d_%H%M)}
 mkdir -p "${OUT}"
@@ -95,13 +67,13 @@ common=(--backend "${BACKEND}" --dt 2.5 --src "${SRC}" --direct-table "${TABLE}"
 if [ -n "${L1_DIR}" ]; then common+=(--l1-dir "${L1_DIR}"); fi
 for days in ${DAYS}; do
   log="${OUT}/stages_${days}d.log"
-  echo "[durations] ${days} d: grids ${GRIDS}, lookups ${LOOKUPS}, band ${BAND:-all}, rows per call ${CHUNKS} over ${ROWS} rows, nt_sub ${NT_SUB:-default}, tail skip px ${TAIL_SKIP_PX:-default}, chunk_batch ${CHUNK_BATCH} -> ${log}"
+  echo "[durations] ${days} d: grids ${GRIDS}, lookups ${LOOKUPS}, band ${BAND:-all}, rows per call ${CHUNKS} over ${ROWS} rows -> ${log}"
   python scripts/emri/emri_direct_stage_timing.py "${common[@]}" --days "${days}" --thresh "${THRESH}" \
     --response dense --response-grid "${GRIDS}" --lookup "${LOOKUPS}" --band-hz "${BAND}" \
-    --batch-rows "${ROWS}" --chunk-rows "${CHUNKS}" --chunk-batch "${CHUNK_BATCH}" --walls "${WALLS}" ${tail_args[@]+"${tail_args[@]}"} \
+    --batch-rows "${ROWS}" --chunk-rows "${CHUNKS}" \
     --reps "${REPS}" --out "${OUT}/stages.jsonl" 2>&1 | grep -v "ModeSelector\|lisaconstants\|warnings.warn" \
     > "${log}" || { echo "[durations] FAILED: ${log}"; tail -4 "${log}"; }
-  grep "^\[snr\]\|^\[data\]\|^\[speed\] orbits\|^\[split\]\|^\[walls\]\|^\[parity\]" "${log}" || true
+  grep "^\[snr\]\|^\[data\]\|^\[speed\] orbits" "${log}" || true
   sed -n '/^\[summary\]/,/^$/p' "${log}" || true
   log="${OUT}/accuracy_${days}d.log"
   echo "[durations] ${days} d accuracy sparse vs pixels vs production -> ${log}"

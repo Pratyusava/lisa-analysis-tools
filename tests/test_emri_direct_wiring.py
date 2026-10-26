@@ -528,114 +528,18 @@ class AdapterTrajectoryPoolTest(_AdapterBase, unittest.TestCase):
         self.assertEqual(arr.shape[0], 2)
 
 
-class _ChirpIntegrator:
-    """A synthetic trajectory integrator: Phi_phi = w t + wddd t^4 / 24, Phi_theta = 0,
-    Phi_r = 0.3 w t (FEW clock), with exact derivatives (the curvature trigger fires once
-    (pi/3) |fddot| tau^3 passes 0.1 rad, fddot growing linearly in t)."""
-
-    def __init__(self, w, wddd):
-        self.w, self.wddd = w, wddd
-        self.generating_trajectory = False
-        self.massratio = 1.0
-
-    def eval_integrator_spline(self, t):
-        t = np.asarray(t, dtype=float)
-        out = np.zeros((t.size, 6))
-        out[:, 3] = self.w * t + self.wddd * t ** 4 / 24.0
-        out[:, 5] = 0.3 * self.w * t
-        return out
-
-    def eval_integrator_derivative_spline(self, t, order=1):
-        t = np.asarray(t, dtype=float)
-        out = np.zeros((t.size, 6))
-        if order == 1:
-            out[:, 3] = self.w + self.wddd * t ** 3 / 6.0
-            out[:, 5] = 0.3 * self.w
-        elif order == 2:
-            out[:, 3] = self.wddd * t ** 2 / 2.0
-        elif order == 3:
-            out[:, 3] = self.wddd * t
-        return out
-
-
-def _synthetic_holder(t_end, K=60):
-    """A FEW-like knots holder ending at ``t_end``: modes (2,2,0,0) and (3,3,0,1) with smooth
-    Teukolsky amplitudes, Ylms for the m >= 0 modes then their -m partners."""
-    t = np.linspace(0.0, t_end, K)
-    x = t / t_end
-    teuk = np.stack([(1.0 + 0.2 * x) * np.exp(0.3j * x), (0.5 - 0.1 * x) * np.exp(-0.2j * x)], axis=1)
-    return SimpleNamespace(t_arr=t, teuk_modes=teuk,
-                           ylms=np.array([0.5 + 0.2j, 0.3 - 0.1j, 0.4 - 0.25j, -0.2 + 0.15j]),
-                           ls=np.array([2, 3]), ms=np.array([2, 3]), ks=np.array([0, 0]), ns=np.array([0, 1]),
-                           phases=None, freqs=None, integrate_backwards=False)
-
-
-#: Synthetic rows (column 0 tags the row) -> (w, wddd, t_end) on the FEW clock of the
-#: real-generator fixture (window from 2e4 s, 128 pixels of 3600 s): two rows hand off inside the
-#: window (m = 3 harmonics, near pixels 88 and 98) and plunge at pixels 100 and 112; the third is
-#: slow and outlasts the window (lookup only).
-_SYNTH_ROWS = {1e6: (2 * np.pi * 1.5e-3, 2.0e-19, 2.0e4 + 100 * 3600.0),
-               2e6: (2 * np.pi * 1.3e-3, 1.8e-19, 2.0e4 + 112 * 3600.0),
-               3e6: (2 * np.pi * 1.2e-3, 0.0, 2.0e6)}
-
-
-def _synthetic_direct():
-    """The REAL EMRIDirectWDM on CPU (spline response, Python lookup, a real n_ref table, the real
-    batch / chunk-row / single-template code) with only FEW replaced: ``_few_knots`` returns the
-    synthetic holder of the row's tag and installs its integrator. Returns ``(gen, rows,
-    refusing_row, tmpdir)``."""
-    from lisatools.domains import WDMLookupTable, WDMSettings
-    from lisatools.response.tdiconfig import TDIConfig
-    from lisatools.sources.emri import wdm_direct as wd
-
-    wdm = WDMSettings(Nf=64, Nt=128, dt=56.25, force_backend="cpu")
-    nf, md, mr = WDMLookupTable.apply_eps_frequency(0.005, wdm, m_ref=20, num_layers_diff=2)
-    tmp = tempfile.TemporaryDirectory()
-    table = WDMLookupTable(wdm, 1, m_ref=mr, norm_freq_single_layer=nf, m_diffs=md,
-                           fdot_vals=WDMLookupTable.apply_eps_fdot(0.05, wdm, fdot_max_factor=0.5),
-                           store_path=os.path.join(tmp.name, "t.h5"), batch_size_gen=32,
-                           build_kind="n_ref_complex", time_layers=32)
-
-    class _Synthetic(wd.EMRIDirectWDM):
-        def _few_knots(self, few_args, few_kwargs, mode_selection=None):
-            if float(few_args[0]) not in _SYNTH_ROWS:
-                raise ValueError("p0 is outside of our domain of validity.")
-            w, wddd, t_end = _SYNTH_ROWS[float(few_args[0])]
-            self.few_gen.inspiral_generator.inspiral_generator = _ChirpIntegrator(w, wddd)
-            return _synthetic_holder(t_end)
-
-    few = SimpleNamespace(inspiral_generator=SimpleNamespace(inspiral_generator=None), inspiral_kwargs={})
-    t_start = 1.0e7
-    gen = _Synthetic(few, table, wdm, orbits=None, tdi_config=TDIConfig("2nd generation", force_backend="cpu"),
-                     t_start=t_start, data_t0=t_start + 2.0e4, Nt_sub=32, fine_dt_plunge=240.0,
-                     response="spline", lookup="python")
-    rows = [np.array([m, 10.0, 0.9, 10.0, 0.3, 1.0, 1.0, qs, phis, 0.7, 4.0, 0.2, 0.0, 0.7])
-            for m, qs, phis in ((1e6, 1.1, 2.3), (2e6, 0.6, 4.1), (3e6, 2.0, 0.5))]
-    refuses = np.array([9e6, 10.0, 0.9, 10.0, 0.3, 1.0, 1.0, 1.4, 1.0, 0.7, 4.0, 0.2, 0.0, 0.7])
-    return gen, rows, refuses, tmp
-
-
 class BatchDomainRefusalTest(unittest.TestCase):
-    """``EMRIDirectWDM.batch(skip_domain_errors=)``: a FEW domain refusal of one row; the
-    plunge-chunk rows batched (``_chunk_rows_batch``) next to the lookup rows."""
+    """``EMRIDirectWDM.batch(skip_domain_errors=)``: a FEW domain refusal of one row."""
 
-    _synth = None
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls._synth is not None:
-            cls._synth[3].cleanup()
-            cls._synth = None
-
-    def _direct(self, **kw):
+    def _direct(self):
         from lisatools.domains import WDMSettings
         from lisatools.sources.emri.wdm_direct import EMRIDirectWDM
 
         class _Stub(EMRIDirectWDM):
-            # column 0 tags the row: 1 -> FEW out-of-domain, 2 -> a real bug, anything else ->
-            # a plunge-chunk row, batched through _chunk_rows_batch (filled with a constant)
+            # column 0 tags the row: 1 -> FEW out-of-domain, 2 -> a real bug,
+            # anything else -> built "alone" (plunge-chunk path) as a constant
             mode_calls = 0
-            captured = []
+            reused = []
 
             def _mode_list(self, few_args, few_kwargs):
                 type(self).mode_calls += 1
@@ -644,275 +548,21 @@ class BatchDomainRefusalTest(unittest.TestCase):
                     raise ValueError("p0 is outside of our domain of validity.")
                 if tag == 2:
                     raise RuntimeError("not a domain error")
-                self._last_holder = SimpleNamespace(t_arr=np.array([0.0, 1.0e12]))
                 return [], 0.0
 
-            def _chunk_item(self, few_args, modes, chunk_start):
-                type(self).captured.append((modes, chunk_start))     # the batch's own FEW call
-                return float(few_args[0])
-
-            def _chunk_rows_batch(self, out_arr, chunk_items, m_lo, m_hi, few_kwargs):
-                for r, v in chunk_items.items():
-                    out_arr[r] = v + 10.0
-                n = len(chunk_items)
-                return dict(rows=n, windows=0, tail_layers=[0] * n, lookup_pixels=0, chunk_pixels=0,
-                            dropped_pixels=0, lookup="kernel")
-
             def _call_knots(self, few_args, few_kwargs, modes, reuse=None):
-                raise AssertionError("a plunge-chunk row went through the single-template path")
+                if reuse is None:                       # the second FEW call of the old path
+                    self._mode_list(few_args, few_kwargs)
+                type(self).reused.append(reuse)
+                return SimpleNamespace(arr=np.full((3, self.wdm.Nf, self.wdm.Nt), few_args[0] + 10.0))
+
+            def __call__(self, *p, **kw):
+                return self._call_knots(p, kw, None)
 
         table = SimpleNamespace(fdot_vals=np.array([-1.0, 1.0]), INTERP_METHOD="spline")
         wdm = WDMSettings(32, 64, 10.0, force_backend="cpu")
         return _Stub(None, table, wdm, orbits=None, tdi_config=SimpleNamespace(nchannels=3),
-                     t_start=0.0, data_t0=0.0, fine_dt=100.0, **kw)
-
-    def _gen_with_two_chunk_rows_and_one_lookup_row(self):
-        """The real generator (:func:`_synthetic_direct`, built once per class): ``self.rows`` =
-        two plunge-chunk rows then one lookup-only row; ``self.row_few_refuses`` is out of FEW's
-        domain."""
-        cls = type(self)
-        if cls._synth is None:
-            cls._synth = _synthetic_direct()
-        gen, self.rows, self.row_few_refuses, _ = cls._synth
-        return gen
-
-    def _gen_in_mode(self, chunk_batch, **kw):
-        """The fixture's REAL generator rebuilt (the same synthetic FEW stand-in, table and grid)
-        with ``EMRI_DIRECT_CHUNK_BATCH`` set to ``chunk_batch`` (read at construction) and the
-        constructor overrides ``kw``."""
-        with mock.patch.dict(os.environ, {"EMRI_DIRECT_CHUNK_BATCH": "1" if chunk_batch else "0"}):
-            return self._sibling(**kw)
-
-    def test_mixed_batch_matches_single_calls(self):
-        """Both chunk-row modes (one call for all chunk rows, and one per row, the default): each
-        batch row is the single template."""
-        from lisatools.utils.utility import asnumpy
-
-        for chunk_batch in (False, True):
-            with self.subTest(chunk_batch=chunk_batch):
-                gen = self._gen_in_mode(chunk_batch)
-                self.assertEqual(gen.chunk_batch, chunk_batch)
-                arr = gen.batch(self.rows, chunk_rows=4)
-                # read before the single calls below replace last_stats
-                self.assertEqual(gen.last_stats["chunk_rows"], 2)
-                self.assertEqual(gen.last_stats["chunk_batch"], int(chunk_batch))
-                self.assertEqual(gen.last_stats["alone"], 0)
-                self.assertEqual(len(gen.last_stats["tail_layers"]), 2)
-                self.assertTrue(all(n > 0 for n in gen.last_stats["tail_layers"]))   # both reach the chunk
-                for r, p in enumerate(self.rows):
-                    one = gen(*p).arr[:, gen._band()[0]:gen._band()[1]]
-                    np.testing.assert_allclose(asnumpy(arr[r]), asnumpy(one), rtol=1e-10, atol=1e-13)
-
-    def test_chunk_batch_off_builds_chunk_rows_one_per_call(self):
-        """EMRI_DIRECT_CHUNK_BATCH off (the default, what the global fits run): every plunge-chunk
-        row goes through its own _chunk_rows_batch call (a one-row {row: item}, in row order); the
-        merged stats are the batched call's and the rows its numbers."""
-        from lisatools.utils.utility import asnumpy
-
-        on = self._gen_in_mode(True)
-        want = asnumpy(on.batch(self.rows, chunk_rows=4))
-        st_on = dict(on.last_stats)
-        off = self._gen_in_mode(False)
-        self.assertFalse(off.chunk_batch)
-        with mock.patch.object(off, "_chunk_rows_batch", wraps=off._chunk_rows_batch) as spy:
-            got = asnumpy(off.batch(self.rows, chunk_rows=4))
-        st_off = dict(off.last_stats)
-        self.assertEqual(spy.call_count, 2)                                   # one per chunk row
-        self.assertEqual([sorted(c.args[1]) for c in spy.call_args_list], [[0], [1]])
-        for k in ("chunk_rows", "windows", "lookup_pixels", "chunk_pixels", "dropped_pixels"):
-            self.assertEqual(st_off[k], st_on[k], k)
-        self.assertEqual(len(st_off["tail_layers"]), len(st_on["tail_layers"]))
-        self.assertEqual(st_off["tail_layers"], st_on["tail_layers"])
-        self.assertEqual((st_off["chunk_batch"], st_on["chunk_batch"]), (0, 1))
-        np.testing.assert_allclose(got, want, rtol=1e-10, atol=1e-13)
-        with mock.patch.object(on, "_chunk_rows_batch", wraps=on._chunk_rows_batch) as spy:
-            on.batch(self.rows, chunk_rows=4)
-        self.assertEqual(spy.call_count, 1)                                   # paired control
-        self.assertEqual(sorted(spy.call_args.args[1]), [0, 1])
-
-    def test_chunk_batch_knob_reads_the_env(self):
-        """``chunk_batch``: explicit > env ``EMRI_DIRECT_CHUNK_BATCH`` (0 / 1, false / true, any
-        case) > False; anything else raises naming the knob."""
-        with mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if k != "EMRI_DIRECT_CHUNK_BATCH"},
-                             clear=True):
-            self.assertFalse(self._direct().chunk_batch)
-        for val, want in (("1", True), ("true", True), ("TRUE", True), ("0", False), ("False", False)):
-            with mock.patch.dict(os.environ, {"EMRI_DIRECT_CHUNK_BATCH": val}):
-                self.assertIs(self._direct().chunk_batch, want, val)
-        with mock.patch.dict(os.environ, {"EMRI_DIRECT_CHUNK_BATCH": "1"}):
-            self.assertFalse(self._direct(chunk_batch=False).chunk_batch)     # explicit wins
-        for bad in ("no", "2", "", "yes"):
-            with mock.patch.dict(os.environ, {"EMRI_DIRECT_CHUNK_BATCH": bad}):
-                with self.assertRaisesRegex(ValueError, "EMRI_DIRECT_CHUNK_BATCH"):
-                    self._direct()
-
-    def _sibling(self, **kw):
-        """A second REAL generator like the fixture's (the same synthetic FEW stand-in, table and
-        grid; the env is read at this call) with the constructor overrides ``kw``."""
-        gen = self._gen_with_two_chunk_rows_and_one_lookup_row()
-        args = dict(orbits=None, tdi_config=gen.tdi_config, t_start=gen.t_start, data_t0=gen.data_t0,
-                    Nt_sub=32, fine_dt_plunge=240.0, response="spline", lookup="python")
-        args.update(kw)
-        return type(gen)(gen.few_gen, gen.table, gen.wdm, **args)
-
-    def test_auto_window_reaches_the_generator(self):
-        """EMRI_DIRECT_NT_SUB=auto[:floor] on the real batch, in both chunk-row modes: each chunk
-        row's tail in one window (one length per _chunk_rows_batch call: the batch's, or each
-        row's own by default); with a floor that holds every tail the template is the fixed-length
-        one, number for number."""
-        from lisatools.utils.utility import asnumpy
-
-        for chunk_batch in (False, True):
-            with self.subTest(chunk_batch=chunk_batch):
-                with mock.patch.dict(os.environ, {"EMRI_DIRECT_NT_SUB": "auto:96"}):
-                    auto = self._sibling(Nt_sub=None, chunk_batch=chunk_batch)
-                self.assertEqual((auto.Nt_sub, auto.nt_sub_floor), ("auto", 96))
-                got = asnumpy(auto.batch(self.rows, chunk_rows=4))
-                st = dict(auto.last_stats)
-                fixed = self._sibling(Nt_sub=96, chunk_batch=chunk_batch)
-                want = asnumpy(fixed.batch(self.rows, chunk_rows=4))
-                self.assertEqual((st["nt_sub_eff"], fixed.last_stats["nt_sub_eff"]), (96, 96))
-                self.assertEqual((st["chunk_rows"], st["windows"]), (2, 2))       # one window per chunk row
-                np.testing.assert_allclose(got, want, rtol=1e-12, atol=1e-15)
-                # a floor below the tails: the length grows past it, still one window per row
-                # the fixture's tails: row 0 hands off at pixel 88 and ends at 100 (span 13), row 1
-                # at 98 and 112 (span 15): ceil4(2 (13 + 8) + 4) = 48, ceil4(2 (15 + 8) + 4) = 52
-                lean = self._sibling(Nt_sub="auto:32", chunk_batch=chunk_batch)
-                lean.batch(self.rows, chunk_rows=4)
-                st = dict(lean.last_stats)
-                self.assertEqual(st["nt_sub_eff"], 52)       # the batch's / the largest per-row length
-                self.assertEqual((st["chunk_rows"], st["windows"]), (2, 2))
-                lean(*self.rows[0])                          # the single-template path: its own length
-                self.assertEqual(lean.last_stats["nt_sub_eff"], 48)
-                lean(*self.rows[1])
-                self.assertEqual(lean.last_stats["nt_sub_eff"], 52)
-
-    def test_tail_skip_knob_reaches_the_generator(self):
-        """EMRI_DIRECT_TAIL_SKIP_PX above the fixture's tails, in both chunk-row modes: both chunk
-        rows keep the lookup through their last pixel (no pairs, no chunk pixels, no tail entry;
-        counted in tail_skipped); each batch row is the single template built with the same knob;
-        the chunk rows differ from the default, tail-keeping template, the lookup-only row does
-        not."""
-        from lisatools.utils.utility import asnumpy
-
-        default = self._gen_with_two_chunk_rows_and_one_lookup_row()
-        want = asnumpy(default.batch(self.rows, chunk_rows=4))
-        self.assertEqual(default.last_stats["tail_skipped"], 0)
-        for chunk_batch in (False, True):
-            with self.subTest(chunk_batch=chunk_batch):
-                with mock.patch.dict(os.environ, {"EMRI_DIRECT_TAIL_SKIP_PX": "200"}):
-                    skip = self._sibling(chunk_batch=chunk_batch)
-                self.assertEqual(skip.tail_skip_px, 200)
-                got = asnumpy(skip.batch(self.rows, chunk_rows=4))
-                st = dict(skip.last_stats)
-                self.assertEqual((st["chunk_rows"], st["tail_skipped"], st["chunk_pixels"], st["windows"]),
-                                 (2, 2, 0, 0))
-                self.assertEqual(st["tail_layers"], [])
-                m_lo, m_hi = skip._band()
-                for r, p in enumerate(self.rows):
-                    np.testing.assert_allclose(got[r], asnumpy(skip(*p).arr[:, m_lo:m_hi]), rtol=1e-10, atol=1e-13)
-                skip(*self.rows[0])                          # a chunk row alone: skipped too
-                self.assertEqual((skip.last_stats["tail_skipped"], skip.last_stats["chunk_pixels"]), (1, 0))
-                for r in (0, 1):
-                    self.assertGreater(np.abs(got[r] - want[r]).max(), 1e-6 * np.abs(want[r]).max())
-                np.testing.assert_allclose(got[2], want[2], rtol=1e-12, atol=1e-15)
-
-    def test_chunk_rows_batch_records_phase_walls(self):
-        """With EMRI_DIRECT_WALLS on, in BOTH chunk-row modes: ``last_stats["walls"]`` of one batch
-        call, exclusive seconds per phase (capture, response, lookup, tail_dense, transform,
-        splice, ...) that add up to the call's total; ``walls_per_call`` one entry per
-        _batch_chunk call (one per ``chunk_rows`` group, whatever the mode; the mode shows in the
-        _chunk_rows_batch calls: one per chunk row, or one for both); the response grid lengths
-        (padded common length, per-row lengths); a single call records its own."""
-        phases = {"capture", "response", "lookup", "tail_dense", "transform", "splice"}
-        for chunk_batch in (False, True):
-            with self.subTest(chunk_batch=chunk_batch):
-                gen = self._gen_in_mode(chunk_batch, walls=True)
-                self.assertTrue(gen.walls)
-                with mock.patch.object(gen, "_chunk_rows_batch", wraps=gen._chunk_rows_batch) as spy:
-                    gen.batch(self.rows, chunk_rows=4)
-                self.assertEqual(spy.call_count, 1 if chunk_batch else 2)
-                st = dict(gen.last_stats)
-                walls = st["walls"]
-                self.assertGreaterEqual(set(walls), phases | {"total"})
-                self.assertTrue(all(v >= 0 for v in walls.values()), walls)
-                parts = sum(v for k, v in walls.items() if k != "total")
-                self.assertLessEqual(abs(parts - walls["total"]), 0.1 * walls["total"], walls)
-                self.assertEqual(len(st["walls_per_call"]), 1)                 # 3 rows, 4 per call
-                self.assertLessEqual(sum(st["walls_per_call"]), walls["total"])
-                self.assertEqual(len(st["n_response_points_rows"]), 2)        # the two chunk rows
-                self.assertEqual(st["n_response_points"], max(st["n_response_points_rows"]))
-                self.assertTrue(all(isinstance(v, float) for v in st["walls_detail"].values()))
-                gen.batch(self.rows, chunk_rows=2)
-                self.assertEqual(len(gen.last_stats["walls_per_call"]), 2)    # rows 0-1, then row 2
-                parts = sum(v for k, v in gen.last_stats["walls"].items() if k != "total")
-                self.assertLessEqual(abs(parts - gen.last_stats["walls"]["total"]),
-                                     0.1 * gen.last_stats["walls"]["total"])
-                gen(*self.rows[0])
-                walls = gen.last_stats["walls"]
-                self.assertGreaterEqual(set(walls), phases | {"total"})
-                parts = sum(v for k, v in walls.items() if k != "total")
-                self.assertLessEqual(abs(parts - walls["total"]), 0.1 * walls["total"], walls)
-
-    def test_walls_are_off_by_default_and_time_nothing(self):
-        """EMRI_DIRECT_WALLS unset (the library and global-fit default): no phase clock is ever
-        built, nothing is timed or synchronised, and ``last_stats`` has no walls keys -- batch
-        (both chunk-row modes) and single call."""
-        from lisatools.sources.emri import wdm_direct as wd
-
-        for chunk_batch in (False, True):
-            with self.subTest(chunk_batch=chunk_batch):
-                with mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if k != "EMRI_DIRECT_WALLS"},
-                                     clear=True):
-                    gen = self._gen_in_mode(chunk_batch)
-                self.assertFalse(gen.walls)
-                with mock.patch.object(wd, "_PhaseWalls", side_effect=AssertionError("a clock was built")) as pw:
-                    gen.batch(self.rows, chunk_rows=4)
-                    st = dict(gen.last_stats)
-                    gen(*self.rows[0])
-                    one = dict(gen.last_stats)
-                self.assertEqual(pw.call_count, 0)
-                for k in ("walls", "walls_detail", "walls_per_call"):
-                    self.assertNotIn(k, st)
-                    self.assertNotIn(k, one)
-                self.assertEqual(st["chunk_rows"], 2)                         # the batch itself ran
-
-    def test_alone_row_with_a_skipped_tail_has_no_entry_and_is_counted(self):
-        """An ``alone`` row (feed="fine" / fixed n_fine: built through __call__) whose tail the skip
-        replaced: counted in tail_skipped with no tail_layers entry, as a batched chunk row; one
-        that kept its tail gets its entry (the single call's counters are stood in)."""
-        from lisatools.domains import WDMSettings
-        from lisatools.sources.emri.wdm_direct import EMRIDirectWDM
-
-        class _Alone(EMRIDirectWDM):
-            def _mode_list(self, few_args, few_kwargs):
-                self._last_holder = SimpleNamespace(t_arr=np.array([0.0, 1.0e12]))
-                return [], 0.0                                   # hands off: an alone row on feed="fine"
-
-            def _call(self, *few_args, **few_kwargs):
-                skipped = int(few_args[0]) == 1
-                self.last_stats = dict(lookup_pixels=10, chunk_pixels=0 if skipped else 5, dropped_pixels=0,
-                                       windows=0 if skipped else 1, tail_layers=0 if skipped else 7,
-                                       tail_skipped=int(skipped), nt_sub_eff=128)
-                return SimpleNamespace(arr=np.zeros((3, self.wdm.Nf, self.wdm.Nt)))
-
-        table = SimpleNamespace(fdot_vals=np.array([-1.0, 1.0]), INTERP_METHOD="spline")
-        d = _Alone(None, table, WDMSettings(32, 64, 10.0, force_backend="cpu"), orbits=None,
-                   tdi_config=SimpleNamespace(nchannels=3), t_start=0.0, data_t0=0.0, fine_dt=100.0, feed="fine")
-        d.batch([np.full(14, 1.0), np.full(14, 0.0)], chunk_rows=4)
-        st = d.last_stats
-        self.assertEqual((st["alone"], st["tail_skipped"], st["tail_layers"], st["windows"]), (2, 1, [7], 1))
-        self.assertEqual((st["lookup_pixels"], st["chunk_pixels"]), (20, 5))
-
-    def test_refused_chunk_row_stays_zero(self):
-        from lisatools.utils.utility import asnumpy
-
-        gen = self._gen_with_two_chunk_rows_and_one_lookup_row()
-        rows = list(self.rows); rows[1] = self.row_few_refuses      # a row inside the chunk group
-        arr = gen.batch(rows, chunk_rows=4, skip_domain_errors=True)
-        self.assertEqual(gen.last_failed_rows, [1])
-        self.assertTrue(np.all(asnumpy(arr[1]) == 0))
-        np.testing.assert_allclose(asnumpy(arr[0]), asnumpy(gen(*rows[0]).arr[:, gen._band()[0]:gen._band()[1]]), rtol=1e-10, atol=1e-13)
+                     t_start=0.0, data_t0=0.0, fine_dt=100.0)
 
     def test_refused_row_is_zero_and_listed_across_chunks(self):
         d = self._direct()
@@ -924,140 +574,14 @@ class BatchDomainRefusalTest(unittest.TestCase):
             self.assertTrue(np.all(out[r] == want), r)
         self.assertEqual(d.last_stats["failed"], 2)
 
-    def test_chunk_rows_reuse_the_first_few_call(self):
-        """A plunge-chunk row is captured from the batch's own _mode_list: one FEW call per row,
-        not two (the 720-day speed test paid ~80 ms per row for the second one), and the chunk
-        rows are batched, never built through the single-template path."""
+    def test_alone_rows_reuse_the_first_few_call(self):
+        """A row built alone (plunge) reuses the batch's own _mode_list: one FEW call per row,
+        not two (the 720-day speed test paid ~80 ms per row for the second one)."""
         d = self._direct()
-        type(d).mode_calls, type(d).captured = 0, []
+        type(d).mode_calls, type(d).reused = 0, []
         d.batch([np.full(14, v) for v in (0.0, 3.0, 4.0)], chunk_rows=3)
         self.assertEqual(type(d).mode_calls, 3)
-        self.assertEqual(type(d).captured, [([], 0.0)] * 3)
-        self.assertEqual((d.last_stats["chunk_rows"], d.last_stats["alone"]), (3, 0))
-
-    def _gen_with_one_chunk_row(self):
-        """Tag-0 rows hand off to the plunge chunk and are batched through the REAL
-        accumulate_harmonic_batch (each one harmonic tripping the curvature trigger at pixel 80
-        of a 128-pixel grid, a fused-kernel stand-in counting the lookup pixels before it; the
-        response stubbed out of _chunk_rows_batch); tag-5 rows stay on the lookup and are batched
-        (response and kernel stubbed: 1000 lookup and 3 dropped pixels per batch); tag-7 rows end
-        before the window (an exact zero, never a chunk row)."""
-        from lisatools.domains import WDMSettings
-        from lisatools.sources.emri import wdm_direct as wd
-
-        class _Plunge(wd.EMRIDirectWDM):
-            def _mode_list(self, few_args, few_kwargs):
-                t_end = -1000.0 if int(few_args[0]) == 7 else 1.0e12      # tag 7: before the window
-                self._last_holder = SimpleNamespace(t_arr=np.array([t_end - 1.0e4, t_end]))
-                return [], (0.0 if int(few_args[0]) in (0, 7) else None)
-
-            def _chunk_item(self, few_args, modes, chunk_start):
-                return dict(modes=modes, chunk_start=chunk_start)
-
-            def _chunk_rows_batch(self, out_arr, chunk_items, m_lo, m_hi, few_kwargs):
-                # the real _chunk_rows_batch without FEW and the response: every chunk row one
-                # harmonic, the batched tail in the pairs form, its counters as there
-                wdm = self.wdm
-                rows = sorted(chunk_items)
-                n_ok = np.arange(self.pixel_edge, wdm.Nt - self.pixel_edge)
-                tn = n_ok * wdm.layer_dt
-                f = np.full_like(tn, 8.2 * wdm.layer_df)
-                track = wd.HarmonicTrack((2, 2, 0, 0), tn, np.ones_like(tn), 2 * np.pi * f * tn, f,
-                                         np.zeros_like(tn), np.where(n_ok >= 80, 1.0, 0.0))
-                N = wdm.Nf * self.Nt_sub
-
-                def tail_td(pairs):
-                    ts = np.stack([self.data_t0 + (n0 * wdm.Nf + np.arange(N)) * wdm.data_dt
-                                   for _, n0, _, _ in pairs])
-                    return np.repeat(np.cos(2 * np.pi * f[0] * ts)[:, None, :], 3, axis=1)
-                tail_td.summed, tail_td.by_pairs = True, True
-
-                st = wd.accumulate_harmonic_batch(
-                    out_arr, self.table, [track] * len(rows), None, n_ok, tail_td, Nf=wdm.Nf, Nt=wdm.Nt,
-                    dt=wdm.data_dt, layer_dt=wdm.layer_dt, layer_df=wdm.layer_df, t0=self.data_t0,
-                    Nt_sub=self.Nt_sub, fdot_axis_max=self.fdot_axis_max, pixel_edge=self.pixel_edge,
-                    sub_row=np.asarray(rows), num_sub=len(rows), m_lo=m_lo,
-                    lookup_kernel=lambda n_stop: dict(lookup_pixels=int(np.sum(3 * (n_stop - n_ok[0])))))
-                return dict(rows=len(rows), windows=st["windows"],
-                            tail_layers=[st["tail_layers"][r] for r in rows],
-                            lookup_pixels=st["lookup_pixels"], chunk_pixels=st["chunk_pixels"],
-                            dropped_pixels=st["dropped_pixels"], lookup="kernel")
-
-            def _knots_feed(self, H, p, t_fine, fly):
-                return None, np.zeros((2, 1)), None, None          # two harmonics
-
-            def _kernel_backend(self, out):
-                return "kernel"
-
-            def _lookup_fn(self, be, out, acc, sub_row, n_ok, m_lo):
-                return lambda n_stop: dict(lookup_pixels=1000, dropped_pixels=3)
-
-        table = SimpleNamespace(fdot_vals=np.array([-1.0, 1.0]), INTERP_METHOD="spline")
-        wdm = WDMSettings(32, 128, 10.0, force_backend="cpu")
-        return _Plunge(None, table, wdm, orbits=None, tdi_config=SimpleNamespace(nchannels=3),
-                       t_start=0.0, data_t0=0.0, fine_dt=100.0, Nt_sub=32)
-
-    def test_batch_stats_carry_the_chunk_rows_counters(self):
-        gen = self._gen_with_one_chunk_row()
-        gen.batch([np.full(14, 0.0)], chunk_rows=4)
-        st = gen.last_stats
-        self.assertEqual((st["chunk_rows"], st["alone"]), (1, 0))
-        self.assertGreater(st["chunk_pixels"], 0)      # the chunk row's chunk pixels are counted
-        self.assertEqual(len(st["tail_layers"]), 1)
-        self.assertGreaterEqual(st["tail_layers"][0], gen.Nt_sub // 2)  # at least one kept interior
-        self.assertGreaterEqual(st["windows"], 1)
-
-    def test_chunk_rows_counters_add_to_the_lookup_rows(self):
-        """On the kernel path the lookup rows' counters are set by stats.update(**tot): the
-        chunk rows' are ADDED to them, not overwritten."""
-        gen = self._gen_with_one_chunk_row()
-        gen.batch([np.full(14, 0.0)])
-        chunk = dict(gen.last_stats)
-        with mock.patch("lisatools.sources.emri.emritdionfly.EMRITDIonFly.sky",
-                        return_value=(0, 0, 0.1, 0.2, 0.3)), \
-                mock.patch("lisatools.sources.emri.emritdionfly.EMRITDIonFly.run_response",
-                           return_value=SimpleNamespace(x=np.array([[-1.0, 1.0e12]]))):
-            gen.batch([np.full(14, 5.0), np.full(14, 0.0)], chunk_rows=4)
-        st = gen.last_stats
-        self.assertEqual((st["chunk_rows"], st["subs"], st["lookup"]), (1, 2, "kernel"))
-        self.assertGreater(chunk["lookup_pixels"], 0)
-        self.assertEqual(st["lookup_pixels"], 1000 + chunk["lookup_pixels"])
-        self.assertEqual(st["dropped_pixels"], 3 + chunk["dropped_pixels"])
-        self.assertEqual(st["chunk_pixels"], chunk["chunk_pixels"])
-        self.assertEqual((st["windows"], st["tail_layers"]),
-                         (chunk["windows"], chunk["tail_layers"]))
-
-    def test_rows_ending_before_the_window_are_not_chunk_rows(self):
-        """A row whose inspiral ends before the window hands off (its chunk start is set) but is
-        an exact zero that never touches the plunge chunk: counted in ended_before_window, not as
-        a chunk row, no tail entry, nothing added to the pixel counters."""
-        gen = self._gen_with_one_chunk_row()
-        gen.batch([np.full(14, 0.0)])
-        chunk = dict(gen.last_stats)
-        with mock.patch("lisatools.sources.emri.emritdionfly.EMRITDIonFly.sky",
-                        return_value=(0, 0, 0.1, 0.2, 0.3)), \
-                mock.patch("lisatools.sources.emri.emritdionfly.EMRITDIonFly.run_response",
-                           return_value=SimpleNamespace(x=np.array([[-1.0, 1.0e12]]))):
-            gen.batch([np.full(14, 5.0)])
-            look = dict(gen.last_stats)
-            gen.batch([np.full(14, 5.0), np.full(14, 0.0), np.full(14, 7.0)], chunk_rows=4)
-        st = gen.last_stats
-        self.assertEqual((st["chunk_rows"], st["alone"]), (1, 0))
-        self.assertEqual(len(st["tail_layers"]), 1)
-        self.assertEqual(st["ended_before_window"], 1)
-        for k in ("lookup_pixels", "chunk_pixels", "dropped_pixels"):
-            self.assertEqual(st[k], look[k] + chunk[k], k)
-        self.assertEqual((st["windows"], st["tail_layers"]),
-                         (chunk["windows"], chunk["tail_layers"]))
-
-    def test_tail_layers_concatenate_across_chunks(self):
-        """batch() sums the chunks' counters; the per-row tail list is concatenated."""
-        gen = self._gen_with_one_chunk_row()
-        gen.batch([np.full(14, 0.0)] * 2, chunk_rows=1)
-        st = gen.last_stats
-        self.assertEqual(st["chunk_rows"], 2)
-        self.assertEqual(len(st["tail_layers"]), 2)
-        self.assertEqual(st["tail_layers"][0], st["tail_layers"][1])
+        self.assertEqual(type(d).reused, [([], 0.0)] * 3)
 
     def test_without_skip_the_refusal_is_typed(self):
         from lisatools.utils.exceptions import WaveformDomainError
@@ -1079,10 +603,9 @@ class BatchDomainRefusalTest(unittest.TestCase):
         class _Ended(EMRIDirectWDM):
             def _mode_list(self, few_args, few_kwargs):
                 t_end = float(few_args[0])
-                # knots every ~1 h: the in-window row's own response grid has enough points
-                self._last_holder = SimpleNamespace(t_arr=np.linspace(0.0, t_end, 16))
+                self._last_holder = SimpleNamespace(t_arr=np.array([0.0, t_end]))
                 self._last_tracks, self._last_track_n = [], np.zeros(0, int)
-                return [(2, 2, 0, 0)], t_end - 1.0      # stops in/before the window: a chunk row
+                return [(2, 2, 0, 0)], t_end - 1.0      # stops in/before the window: built alone
 
             def _dense_response(self, items, t_fine):
                 raise _Reached()
@@ -1095,8 +618,6 @@ class BatchDomainRefusalTest(unittest.TestCase):
         out = d.batch([np.r_[5.0e4 - 700.0, np.zeros(13)]])          # ends 700 s before the start
         self.assertTrue(np.all(out == 0.0))
         self.assertEqual(d.last_failed_rows, [])
-        st = d.last_stats                                   # not a plunge-chunk row
-        self.assertEqual((st["alone"], st["ended_before_window"], st["tail_layers"]), (0, 1, []))
         with mock.patch("lisatools.sources.emri.emritdionfly.EMRITDIonFly.sky",
                         return_value=(0, 0, 0.1, 0.2, 0.3)), \
                 mock.patch("lisatools.sources.emri.wdm_direct.dense_inputs_from_holder",
