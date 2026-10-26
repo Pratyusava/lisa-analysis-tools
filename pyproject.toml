@@ -108,6 +108,7 @@ optional-dependencies.testing = [
 optional-dependencies.dev = [
   "black",
   "isort",
+  "flake8",
   "mypy",
   "pre-commit",
   "pylint",

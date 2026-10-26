@@ -48,4 +48,7 @@ done
 pip install jax interpax optax
 pip install --no-deps -e "$(dirname "$LAT_DIR")/EMRI-Search"
 
+# 5. Validation tools for `make check` (format -> lint -> typecheck -> test).
+pip install black isort flake8 mypy
+
 python -W ignore -c "import lisatools, few, jax; print('backends:', [b for b in ('cpu', 'jax') if lisatools.has_backend(b)])"

@@ -118,12 +118,24 @@ The `[testing]` extras (`eryn`, `gbgpu`, `corner`, `gpubackendtools`, `matplotli
 
 ## Lint / Format
 
-Pre-commit is configured with `black` (line-length 100, target py312) and `isort` (black profile). `mypy` and `pylint` are available as dev extras.
+Pre-commit is configured with `black` (line-length 100, target py312) and `isort` (black profile). `flake8`, `mypy` and `pylint` are available as dev extras.
 
 ```sh
 pre-commit install         # one-time
 pre-commit run --all-files # run on the whole tree
 ```
+
+## Validation
+
+After any code change under the paths `make check` covers, run `make check`;
+all checks must pass before the work counts as complete. It runs, in order,
+black + isort (auto-format), flake8 (lint), mypy (types), then the unittest
+modules for those paths. `CHECKED` / `TESTS` in the `Makefile` list the
+covered paths: most of the tree predates the pipeline and is not yet black /
+isort / flake8 clean, so add a path there once it passes, and keep new code
+inside it. For changes elsewhere, run the relevant test modules
+(`make test-all` runs everything). Tools: the `[dev]` extras
+(`black isort flake8 mypy`).
 
 ## Backend Architecture
 
@@ -311,6 +323,6 @@ Downstream waveform packages (GBGPU, BBHx, FastEMRIWaveforms) consume LAT header
 ## Notes for Working in This Tree
 
 - The repository root contains many untracked dev artifacts (notebooks, `.npy`, `.png`, `back_*.py`, `fix_*.py`, scratch `.txt` files). These are personal scratch and not part of the package — don't modify or rely on them. Package code lives under `src/lisatools/` and `tests/`.
-- `Makefile` at the repo root is leftover from a previous project (`lisacattools`) — ignore it; build with `pip` / `cmake` as described above.
+- `Makefile` at the repo root is the validation entry point (`make check`, see "Validation"); it does not build the package — build with `pip` / `cmake` as described above.
 - When editing native code, remember the `.cu → .cxx` copy step: a change to `Detector.cu` rebuilds both CPU and GPU targets.
 - When adding Python code that needs to work on both CPU and GPU, follow the `xp` pattern (resolve the array module from an input array via `get_array_module`) rather than importing `cupy` unconditionally.
