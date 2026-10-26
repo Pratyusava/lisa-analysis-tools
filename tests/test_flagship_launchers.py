@@ -503,9 +503,7 @@ class ParentChainTest(unittest.TestCase):
         self.assertEqual(fr.RUNS["12mo"].parent.mbhb_ids, fr.RUNS["9mo"].mbhb_ids)
         self.assertEqual(fr.RUNS["12mo"].parent.days, fr.RUNS["9mo"].days)
         self.assertEqual(fr.RUNS["18mo"].parent, "12mo")
-        # ⚠ TEMPORARY (Mike 2026-10-24, the 24mo smoke test off the LIVE 12mo):
-        # the permanent chain value is "18mo" -- restore it with runs.py.
-        self.assertEqual(fr.RUNS["24mo"].parent, "12mo")
+        self.assertEqual(fr.RUNS["24mo"].parent, "18mo")
 
     def test_every_parented_run_reads_its_parent(self):
         for name in PARENTED:
@@ -527,10 +525,7 @@ class ParentChainTest(unittest.TestCase):
                 self.assertEqual(e["EMRI_SOURCE_WARM_START_IDS"], e["EMRI_IDS"])
                 self.assertEqual(e["SOBBH_SOURCE_WARM_START_IDS"], e["SOBHB_IDS"])
                 self.assertEqual(e["SOURCE_WARM_START_SNR_MIN"], "10")
-                # the template's 3 unless the run DECLARES a level-2 override
-                # (⚠ TEMPORARY 2026-10-24: the 24mo smoke test seeds 1 iteration)
-                self.assertEqual(e["GB_SEARCH_SEED_ITERS"],
-                                 run.overrides.get("GB_SEARCH_SEED_ITERS", "3"))
+                self.assertEqual(e["GB_SEARCH_SEED_ITERS"], "3")
                 self.assertEqual(e["GB_SEARCH_3_WARM_EVERY"], "5")
                 self.assertEqual(e["GB_REPLACE_WARM_PASS"], "1")
                 self.assertEqual(e["SOURCE_SEARCH_POSITION"], "after_seed")

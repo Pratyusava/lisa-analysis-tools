@@ -19,25 +19,15 @@
 #   MBHB_IDS=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19 (t_c < 720 + 14 d); EMRI / SOBHB: all;
 #   STORE_DIR /shared/data/global_fit_output/gf_prod_24mo_flagship/, BASE_FILE_NAME gf_prod_24mo,
 #   job gf24mo_flagship, log gf24mo_flagship_<jobid>.log; NGPUS default 4.
-#   PARENT = the 12mo (360 d): GF_SEED_STORE /shared/data/global_fit_output/gf_prod_12mo_flagship/gf_prod_12mo_testing.h5
-#     (GB warm start fitted from its last GB_WARM_START_LAST_K stored rows -> warmstart/gf_prod_12mo_flagship_refereed.npz, auto-built
+#   PARENT = the 18mo (540 d): GF_SEED_STORE /shared/data/global_fit_output/gf_prod_18mo_flagship/gf_prod_18mo_testing.h5
+#     (GB warm start fitted from its last GB_WARM_START_LAST_K stored rows -> warmstart/gf_prod_18mo_flagship_refereed.npz, auto-built
 #     on the first launch when missing; the psd pinned at its maxlogL cold walker (galfor stays the
 #     hand-set offline estimate, ruling 2026-09-25); the source
-#     warm start copies its SNR > 10 leaves by catalogue id: MBHB 0,2,3,4,5,7,9,10,12,15,16,18, every EMRI / SOBHB; the monitor page overlays
-#     it: GF_MONITOR_ADD_INFO=/shared/data/global_fit_output/gf_prod_12mo_flagship).
+#     warm start copies its SNR > 10 leaves by catalogue id: MBHB 0,2,3,4,5,6,7,9,10,12,13,15,16,18,19, every EMRI / SOBHB; the monitor page overlays
+#     it: GF_MONITOR_ADD_INFO=/shared/data/global_fit_output/gf_prod_18mo_flagship).
 #     The parent store must be COMPLETE and readable when this launches.
-#   OVERRIDES (level 2, rewritten export lines): GB_SEARCH_SEED_ITERS=1
 #
 # NOTES:
-#   ⚠ TEMPORARY SMOKE-TEST CONFIGURATION (Mike 2026-10-24): PARENT = the LIVE
-#   12mo flagship run gf_prod_12mo_flagship (no 18mo run exists yet) and
-#   gb_search_seed = ONE iteration (GB_SEARCH_SEED_ITERS override; 3 in the
-#   template). Every source (MBHB / SOBHB / EMRI / VGB) starts at the
-#   catalogue injection (SOURCE_WARM_START_STORE empty, *_START_FACTOR=0);
-#   all 20 MBHBs are in. While the 12mo job is still WRITING its store,
-#   launch with GF_SEED_STORE=<12mo dir>/gf_prod_12mo_testing_running_backup_copy.h5
-#   (README: 'A child whose parent is still running'). Restore parent="18mo"
-#   and drop the override in runs.py after the test, then rebuild.
 #   All 20 catalogue MBHBs merge inside 720 d (the last, 14, at 712.7 d).
 #   EDGE_CROP 120 (guard needs 95). Same unverified-at-this-Tobs list as the
 #   18mo; the F-stat host-mapped float32 grid (TODO) is the real fix for the
@@ -449,7 +439,7 @@ export GF_MONITOR_TIMEOUT=1800
 # inherits it; the CLI twin is python -m lisatools.globalfit.monitor --add-info.
 # The default is THIS RUN'S PARENT (runs.py); GF_MONITOR_ADD_INFO=none on the
 # launch line drops it. Not a run knob: the sampler never reads it.
-export GF_MONITOR_ADD_INFO=${GF_MONITOR_ADD_INFO:-/shared/data/global_fit_output/gf_prod_12mo_flagship}
+export GF_MONITOR_ADD_INFO=${GF_MONITOR_ADD_INFO:-/shared/data/global_fit_output/gf_prod_18mo_flagship}
 
 export USE_GPU=1
 export GPU_BACKEND=cuda13x
@@ -4071,7 +4061,7 @@ export GB_ROUTER_THREADED=1
 # and invisible to a fresh-store rebuild. Every other use of STORE_DIR in this
 # script already writes ${STORE_DIR}/..., so the doubled slash the default
 # produces is the same one they produce, and harmless.
-export GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS-${STORE_DIR}/warmstart/gf_prod_12mo_flagship_refereed.npz}
+export GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS-${STORE_DIR}/warmstart/gf_prod_18mo_flagship_refereed.npz}
 # AUTO-BUILD (2026-09-14, after the first launch died on the missing npz;
 # user: "Check if it is done, if not run it. I would like it to be
 # automatic."). When the npz is missing, recipe build now runs the
@@ -4120,7 +4110,7 @@ export GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS-${STORE_DIR}/warmstar
 # another store would be the exact "warm start and noise pin from different
 # folders" split the ruling forbids. A store that cannot be resolved means
 # no pin, which means the noise stages run -- loudly, see below.
-export GF_SEED_STORE=${GF_SEED_STORE:-/shared/data/global_fit_output/gf_prod_12mo_flagship/gf_prod_12mo_testing.h5}
+export GF_SEED_STORE=${GF_SEED_STORE:-/shared/data/global_fit_output/gf_prod_18mo_flagship/gf_prod_18mo_testing.h5}
 if [ ! -f "${GF_SEED_STORE}" ]; then
   _seed_dir="${GF_SEED_STORE}"
   [ -f "${_seed_dir}" ] || [ -d "${_seed_dir}" ] || _seed_dir=$(dirname "${GF_SEED_STORE}")
@@ -4137,8 +4127,8 @@ if [ ! -f "${GF_SEED_STORE}" ]; then
     fi
   else
     echo "[V9-SEED] GF_SEED_STORE does not exist: ${GF_SEED_STORE}"
-    echo "[V9-SEED] Candidate 12mo run directories on this filesystem:"
-    find /shared/data/global_fit_output -maxdepth 1 -type d -name 'gf_prod_12mo*' \
+    echo "[V9-SEED] Candidate 18mo run directories on this filesystem:"
+    find /shared/data/global_fit_output -maxdepth 1 -type d -name 'gf_prod_18mo*' \
       2>/dev/null | sort | sed 's/^/[V9-SEED]   /'
     echo "[V9-SEED] Re-launch with GF_SEED_STORE=<one of those>/<store>.h5 to"
     echo "[V9-SEED] pin the noise; otherwise the noise stages will fit it."
@@ -4169,8 +4159,8 @@ if [ "${GB_WARM_START_SOURCE_STORE}" != "${GF_SEED_STORE}" ]; then
   echo "[V9-SEED]   warm start: ${GB_WARM_START_SOURCE_STORE}"
   echo "[V9-SEED]   noise pin : ${GF_SEED_STORE}"
 fi
-export GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-31104000}   # the 12mo parent (360 d)
-export GB_WARM_START_LAST_K=${GB_WARM_START_LAST_K:-300}   # flagship (Mike 2026-10-08): the last 300 stored cold-chain rows x the parent's walkers (4 -> 1,200 samples) of the 12mo full_pe (~2.9M leaf rows into the fit at 6 mo; build the npz by hand on a login node if the in-job build is slow)
+export GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-46656000}   # the 18mo parent (540 d)
+export GB_WARM_START_LAST_K=${GB_WARM_START_LAST_K:-300}   # flagship (Mike 2026-10-08): the last 300 stored cold-chain rows x the parent's walkers (4 -> 1,200 samples) of the 18mo full_pe (~2.9M leaf rows into the fit at 6 mo; build the npz by hand on a login node if the in-job build is slow)
 # GB warm-start SELF REFIT (user rulings 2026-10-13: "rebuild our warm start
 # proposal with the last 50 samples (x4 walkers)" / "keep the original warm
 # start in the fit"; 2026-10-14: refit every stored row in gb_search_1 and
@@ -4226,7 +4216,7 @@ if [ -n "${GB_WARM_START_COMPONENTS}" ] && [ ! -f "${GB_WARM_START_COMPONENTS}" 
     echo "[WARMSTART] Point GB_WARM_START_SOURCE_STORE at the previous run's FULL FINAL h5,"
     echo "[WARMSTART] or build the npz by hand:"
     echo "[WARMSTART]   python -m lisatools.globalfit.warmstart.fit_from_store --store <store.h5> \\"
-    echo "[WARMSTART]       --last-k ${GB_WARM_START_LAST_K} --tobs ${GB_WARM_START_SOURCE_TOBS} --out <dir>/gf_prod_12mo_flagship_fit.npz"
+    echo "[WARMSTART]       --last-k ${GB_WARM_START_LAST_K} --tobs ${GB_WARM_START_SOURCE_TOBS} --out <dir>/gf_prod_18mo_flagship_fit.npz"
     echo "[WARMSTART]   python -m lisatools.globalfit.warmstart.match_referee --npz <...fit.npz> --store <store.h5>"
     echo "[WARMSTART]   python -m lisatools.globalfit.warmstart.referee_apply --fit <...fit.npz> \\"
     echo "[WARMSTART]       --referee <...fit_referee.npz> --out ${GB_WARM_START_COMPONENTS}"
@@ -4497,7 +4487,7 @@ export STAGE_V9_SEARCH=1
 # within MAXLOGL_TOL), afresh each cycle. Then full_pe, declared as today.
 # The resolved recipe, no data / no MPI, under this script's exports:
 #   python scripts/fstat_proposal/run_combined_staged.py --print-recipe
-export GB_SEARCH_SEED_ITERS=1
+export GB_SEARCH_SEED_ITERS=3
 export GB_SEARCH_STAGES=${GB_SEARCH_STAGES:-1,2}
 export GB_SEARCH_1_SOURCE_EVERY=${GB_SEARCH_1_SOURCE_EVERY:-1}   # 2026-10-10 ruling: sobbh/mbh/emri every cycle in gb_search_1 too (was 0)
 export GB_SEARCH_2_SOURCE_EVERY=${GB_SEARCH_2_SOURCE_EVERY:-1}
@@ -4917,7 +4907,7 @@ export VGB_START_FACTOR=0.0
 # on the cluster BEFORE launching, once per branch (prints each id's 6mo SNR
 # and the warm / truth decision):
 #   python -m lisatools.globalfit.warmstart.sources --store $GF_SEED_STORE \
-#       --branch mbh --ids 0,2,3,4,5,7,9,10,12,15,16,18
+#       --branch mbh --ids 0,2,3,4,5,6,7,9,10,12,13,15,16,18,19
 # ⚠ OFF BY DEFAULT SINCE 2026-10-22 (Mike: "We want those [VGB, MBHB, SOBHB,
 # EMRI] to always start at the catalog injected values rather than the last
 # run's values"): every source leaf starts at exact truth (*_START_FACTOR=0
@@ -4928,7 +4918,7 @@ export VGB_START_FACTOR=0.0
 # scripts/fstat_proposal/set_store_sources_to_injection.py, then relaunch.
 export SOURCE_WARM_START_STORE=${SOURCE_WARM_START_STORE-}
 export SOURCE_WARM_START_SNR_MIN=${SOURCE_WARM_START_SNR_MIN:-10}
-export MBH_SOURCE_WARM_START_IDS=${MBH_SOURCE_WARM_START_IDS:-0,2,3,4,5,7,9,10,12,15,16,18}   # the PARENT's MBHB_IDS (runs.py)
+export MBH_SOURCE_WARM_START_IDS=${MBH_SOURCE_WARM_START_IDS:-0,2,3,4,5,6,7,9,10,12,13,15,16,18,19}   # the PARENT's MBHB_IDS (runs.py)
 export EMRI_SOURCE_WARM_START_IDS=${EMRI_SOURCE_WARM_START_IDS:-0,1,2,3,4,5,6,7}
 export SOBBH_SOURCE_WARM_START_IDS=${SOBBH_SOURCE_WARM_START_IDS:-0,1,2,3,4,5}
 # SOBBH chunked scoring width: converged value (S3 ruling; the 11-h-layer
