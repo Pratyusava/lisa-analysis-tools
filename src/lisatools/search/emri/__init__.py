@@ -17,6 +17,7 @@ from .optimize import (  # noqa: F401
     DifferentialEvolution,
     OptimizationResult,
     Optimizer,
+    population_map,
 )
 from .pipeline import EMRISearch, SearchResult  # noqa: F401
 from .psd import SensitivityPSD, TabulatedNoiseModel  # noqa: F401

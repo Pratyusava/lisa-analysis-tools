@@ -17,7 +17,7 @@ from typing import NamedTuple
 import numpy as np
 
 from .data import SFTData
-from .optimize import OptimizationResult, Optimizer
+from .optimize import OptimizationResult, Optimizer, population_map
 from .statistic import SemiCoherentStatistic
 
 
@@ -40,7 +40,8 @@ class EMRISearch:
         track_model: Callable ``(x, shift) -> Track`` on the JAX backend, with ``ndim``,
             ``shift_for_plunge(T_pl)`` and ``initial_population(n, seed=...)``.
         optimizer: Population optimiser (JAX).
-        n_initial: Initial draws before keeping the best ``n_population``.
+        n_initial: Initial draws before keeping the best ``n_population`` (scored in
+            groups of ``optimizer.batch_size`` when it is set).
         n_population: Population the optimiser works on.
         initial_kwargs: Forwarded to ``track_model.initial_population`` (e.g.
             ``f0_range``).
@@ -120,7 +121,8 @@ class EMRISearch:
                 self.n_initial, seed=seed, **self.initial_kwargs
             )
             x0 = self.statistic.xp.asarray(x0)
-            initial_loss = jax.jit(jax.vmap(loss))(x0)
+            batch_size = getattr(self.optimizer, "batch_size", None)
+            initial_loss = jax.jit(population_map(loss, batch_size))(x0)
             x0 = x0[np.argsort(np.asarray(initial_loss))[: self.n_population]]
 
         result = self.optimizer.run(loss, x0, jax.random.PRNGKey(seed))

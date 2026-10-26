@@ -567,6 +567,16 @@ class OptimizerTest(unittest.TestCase):
         np.testing.assert_array_equal(runs[0].x, runs[1].x)
         self.assertFalse(np.array_equal(runs[0].x, runs[2].x))
 
+    def test_batched_population_matches_vmap(self):
+        x0 = np.random.default_rng(1).uniform(size=(13, 3))  # 13 = 3 x 4 + 1: a remainder
+        for make in (
+            lambda b: AdamDE(n_steps=15, adam=Adam(learning_rate=1e-2), batch_size=b),
+            lambda b: DifferentialEvolution(n_steps=15, batch_size=b),
+        ):
+            full, batched = (make(b).run(self.loss, x0, jax.random.PRNGKey(4)) for b in (None, 4))
+            np.testing.assert_allclose(batched.x, full.x, rtol=0, atol=1e-14)
+            np.testing.assert_allclose(batched.loss, full.loss, rtol=0, atol=1e-14)
+
     def test_differential_evolution(self):
         x0 = self.x0()
         start = float(jax.vmap(self.loss)(jnp.clip(jnp.asarray(x0), 0, 1)).min())
@@ -785,15 +795,19 @@ class SearchTest(unittest.TestCase):
         rel = np.abs(got[n_late:] - true_f[n_late:]) / true_f[n_late:]
         self.assertLess(np.median(rel), 1e-3)
 
+    def test_batched_search_matches(self):
+        full = self.make_search(n_steps=5)
+        batched = self.make_search(n_steps=5)
+        batched.optimizer.batch_size = 5  # 64 screened, 16 optimised: remainders both ways
+        a, b = (s.run(T_pl=N_SEG * T_SFT, seed=0) for s in (full, batched))
+        np.testing.assert_allclose(b.best_x, a.best_x, rtol=0, atol=1e-12)
+        self.assertAlmostEqual(b.best_statistic, a.best_statistic, places=8)
+
     def test_config_pickles(self):
         search = self.make_search(n_steps=1)
         clone = pickle.loads(pickle.dumps(copy.deepcopy(search)))
         self.assertEqual(clone.statistic.P, search.statistic.P)
         np.testing.assert_array_equal(clone.track_model.basis.V, self.basis.V)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class InjectionTest(unittest.TestCase):
@@ -898,3 +912,7 @@ class InjectionTest(unittest.TestCase):
         for got, want in ((signal.sfts[0], ref["signal_sfts"]), (data.sfts[0], ref["data_sfts"])):
             atol = 1e-9 * np.abs(want).max()
             np.testing.assert_allclose(got, want.T, rtol=1e-9, atol=atol)
+
+
+if __name__ == "__main__":
+    unittest.main()

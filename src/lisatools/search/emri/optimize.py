@@ -2,8 +2,8 @@
 
 An optimiser minimises ``loss(x)`` over a population of unit-cube points
 ``x`` (shape ``(n, ndim)``) via :meth:`Optimizer.run`, which returns an
-:class:`OptimizationResult`. ``loss`` takes one point; optimisers vmap / grad
-it themselves.
+:class:`OptimizationResult`. ``loss`` takes one point; optimisers map / grad
+it over the population themselves (:func:`population_map`).
 
 * :class:`DifferentialEvolution` -- gradient-free DE with greedy selection.
 * :class:`AdamDE` -- Lorenzo Speri's hybrid: one Adam step on every member,
@@ -11,7 +11,7 @@ it themselves.
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, NamedTuple
+from typing import Callable, NamedTuple, Optional
 
 import numpy as np
 
@@ -33,6 +33,22 @@ def _jax():
 
     jax.config.update("jax_enable_x64", True)
     return jax, jnp
+
+
+def population_map(fn, batch_size=None):
+    """``fn`` (one point -> pytree) mapped over the population's leading axis.
+
+    ``batch_size=None`` vectorises the whole population in one ``jax.vmap``;
+    an integer evaluates it ``batch_size`` members at a time
+    (``jax.lax.map``), so peak memory scales with ``batch_size`` instead of the
+    population at about the same total cost. Members are independent, so the
+    results are the same either way.
+    """
+    jax, _ = _jax()
+    if batch_size is None:
+        return jax.vmap(fn)
+    batch_size = int(batch_size)
+    return lambda x: jax.lax.map(fn, x, batch_size=batch_size)
 
 
 @dataclass
@@ -105,13 +121,16 @@ def greedy_selection(x, loss, x_trial, loss_trial):
 
 @dataclass
 class Optimizer:
-    """Base class. ``save_every`` controls how often :attr:`history` is filled.
+    """Base class. ``save_every`` controls how often :attr:`history` is filled;
+    ``batch_size`` evaluates the population that many members at a time
+    (:func:`population_map`; ``None``: all at once).
 
     All randomness comes from the ``key`` passed to :meth:`run`.
     """
 
     n_steps: int = 200
     save_every: int = 10
+    batch_size: Optional[int] = None
 
     def run(self, loss: Callable, x0, key) -> OptimizationResult:
         raise NotImplementedError
@@ -140,7 +159,7 @@ class DifferentialEvolution(_DEOptimizer):
 
     def run(self, loss, x0, key):
         jax, jnp = _jax()
-        batch_loss = jax.jit(jax.vmap(loss))
+        batch_loss = jax.jit(population_map(loss, self.batch_size))
         x = jnp.clip(jnp.asarray(x0), 0.0, 1.0)
         fx = batch_loss(x)
         history = _new_history()
@@ -173,8 +192,8 @@ class AdamDE(_DEOptimizer):
 
     def run(self, loss, x0, key):
         jax, jnp = _jax()
-        value_and_grad = jax.vmap(jax.value_and_grad(loss))
-        batch_loss = jax.jit(jax.vmap(loss))
+        value_and_grad = population_map(jax.value_and_grad(loss), self.batch_size)
+        batch_loss = jax.jit(population_map(loss, self.batch_size))
 
         @jax.jit
         def adam_step(x, state):
