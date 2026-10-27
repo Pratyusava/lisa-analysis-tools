@@ -27,7 +27,7 @@ from ...diagnostic import snr as lat_snr
 from ...domains import FDSettings
 from ...utils.constants import YRSID_SI
 from ...utils.utility import asnumpy
-from .data import SFTData, gaussian_noise
+from .data import FDData, SFTData, gaussian_noise
 from .tracks import backward_inspiral, kerr_ecc_eq_inspiral
 
 ANGLE_NAMES = ("qS", "phiS", "qK", "phiK", "Phi_phi0", "Phi_theta0", "Phi_r0")
@@ -79,8 +79,9 @@ class EMRIInjection:
     fixed noise realisation.
 
     The data streams of a search are built from it: :meth:`timeseries` (signal,
-    noise, or both) and :meth:`sft_data` (their SFTs, optionally only the first
-    ``n_segments``). :meth:`with_noise` freezes a noise draw, so every stream
+    noise, or both), :meth:`sft_data` (their SFTs, optionally only the first
+    ``n_segments``) and :meth:`fd_data` (their band-limited FFT, optionally
+    only the first ``duration``). :meth:`with_noise` freezes a noise draw, so every stream
     taken from the returned injection (each duration, with or without the
     signal) shares it.
 
@@ -191,6 +192,31 @@ class EMRIInjection:
             n_segments=n_segments,
             **kwargs,
         )
+
+    def fd_data(
+        self,
+        psd=None,
+        signal=True,
+        noise=True,
+        rng=None,
+        duration=None,
+        **kwargs,
+    ) -> FDData:
+        """Band-limited FFT of :meth:`timeseries` (``signal`` / ``noise`` / ``rng`` as there).
+
+        The coherent counterpart of :meth:`sft_data`, for :mod:`.excess_power`.
+
+        Args:
+            psd: PSD of a fresh noise draw and of the whitening; ``None`` uses
+                :attr:`psd`.
+            duration: Keep the first ``duration`` seconds only (the data stream
+                ending there, e.g. ``n_segments * T_sft``); ``None`` keeps all.
+            **kwargs: Forwarded to :meth:`~.data.FDData.from_timeseries`
+                (``min_freq``, ``max_freq``).
+        """
+        psd = self._psd(psd)
+        data = self.timeseries(signal=signal, noise=noise, rng=rng, psd=psd)
+        return FDData.from_timeseries(data, self.dt, psd, duration=duration, **kwargs)
 
     def _psd(self, psd):
         psd = self.psd if psd is None else psd

@@ -2,8 +2,8 @@
 
 :class:`EMRISearch` composes four swappable parts:
 
-* data       -- :class:`~.data.SFTData`
-* statistic  -- a :class:`~.statistic.SemiCoherentStatistic` (what a track scores)
+* data       -- a data container (:class:`~.data.SFTData`, :class:`~.data.FDData`)
+* statistic  -- a :class:`~.statistic.Statistic` on that data (what a track scores)
 * tracks     -- a track model, ``model(x, shift) -> Track`` over the unit cube
 * optimizer  -- an :class:`~.optimize.Optimizer` (how the cube is explored)
 
@@ -16,9 +16,8 @@ from typing import NamedTuple
 
 import numpy as np
 
-from .data import SFTData
 from .optimize import OptimizationResult, Optimizer, population_map
-from .statistic import SemiCoherentStatistic
+from .statistic import Statistic
 
 
 class SearchResult(NamedTuple):
@@ -34,7 +33,7 @@ class EMRISearch:
     """Maximise ``statistic(data, track_model(x, shift))`` over the unit cube.
 
     Args:
-        data: The SFT data.
+        data: The data container the statistic reads (:meth:`~.statistic.Statistic.prepare`).
         statistic: Detection statistic on the JAX backend (the optimisers
             differentiate and vmap it).
         track_model: Callable ``(x, shift) -> Track`` on the JAX backend, with ``ndim``,
@@ -49,8 +48,8 @@ class EMRISearch:
 
     def __init__(
         self,
-        data: SFTData,
-        statistic: SemiCoherentStatistic,
+        data,
+        statistic: Statistic,
         track_model,
         optimizer: Optimizer,
         n_initial=128,
@@ -95,26 +94,27 @@ class EMRISearch:
                 stacklevel=3,
             )
 
-    def loss_function(self, sfts, shift):
-        """``x -> -statistic`` for one trial plunge (the optimiser's objective)."""
+    def loss_function(self, arr, shift):
+        """``x -> -statistic`` for one trial plunge (the optimiser's objective);
+        ``arr`` is the statistic's data array (:meth:`~.statistic.Statistic.prepare`)."""
         stat, model = self.statistic, self.track_model
 
         def loss(x):
-            return -stat.evaluate(sfts, model(x, shift))
+            return -stat.evaluate(arr, model(x, shift))
 
         return loss
 
-    def run(self, T_pl, seed=0, sfts=None, x0=None) -> SearchResult:
+    def run(self, T_pl, seed=0, data=None, x0=None) -> SearchResult:
         """Search one trial plunge time ``T_pl`` [s].
 
-        ``sfts`` overrides the data SFTs (e.g. a noise-only realisation for the
-        background); ``x0`` overrides the initial population.
+        ``data`` overrides the data container (e.g. a noise-only realisation
+        for the background); ``x0`` overrides the initial population.
         """
         import jax
 
         shift = self.track_model.shift_for_plunge(T_pl)
-        sfts = self.statistic.to_backend(self.data.sfts if sfts is None else sfts)
-        loss = self.loss_function(sfts, shift)
+        arr = self.statistic.prepare(self.data if data is None else data)
+        loss = self.loss_function(arr, shift)
 
         if x0 is None:
             x0 = self.track_model.initial_population(
@@ -136,6 +136,6 @@ class EMRISearch:
             optimization=result,
         )
 
-    def scan(self, T_pl_grid, seed=0, sfts=None):
+    def scan(self, T_pl_grid, seed=0, data=None):
         """One :meth:`run` per trial plunge time."""
-        return [self.run(T_pl, seed=seed + i, sfts=sfts) for i, T_pl in enumerate(T_pl_grid)]
+        return [self.run(T_pl, seed=seed + i, data=data) for i, T_pl in enumerate(T_pl_grid)]

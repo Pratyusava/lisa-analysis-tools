@@ -1,14 +1,22 @@
-"""Semi-coherent detection statistics on SFT data.
+"""Detection statistics: the common interface and the semi-coherent family.
 
-A statistic scores a :class:`~.tracks.Track` against SFT data. Subclasses of
+A statistic scores a :class:`~.tracks.Track` against data. Every statistic is a
+:class:`Statistic`: :meth:`~Statistic.prepare` turns a data container into the
+array it reads (on its backend), and :meth:`~Statistic.evaluate` scores one
+track against that array. The search (:class:`~.pipeline.EMRISearch`) uses
+only these two, so statistics on different data swap freely.
+
+Semi-coherent statistics read SFTs (:class:`~.data.SFTData`). Subclasses of
 :class:`SemiCoherentStatistic` implement :meth:`~SemiCoherentStatistic.segment_terms`
 (per-segment matched-filter magnitudes and template norms) and optionally
 override :meth:`~SemiCoherentStatistic.evaluate` (how segments combine).
-Which segments count is a separate, swappable :class:`SegmentMask`.
+Which segments count is a separate, swappable :class:`SegmentMask`. The
+coherent, delay-scanning statistics are in :mod:`.excess_power`.
 
-The backend (``"cpu"`` = NumPy, ``"jax"``) is fixed at instantiation; the SFT
-array is passed in already on that backend (:meth:`~SemiCoherentStatistic.to_backend`)
-so a JAX objective can take it as a traced argument instead of a baked constant.
+The backend (``"cpu"`` = NumPy, ``"jax"``) is fixed at instantiation; the data
+array is passed in already on that backend (:meth:`~Statistic.prepare`,
+:meth:`~Statistic.to_backend`) so a JAX objective can take it as a traced
+argument instead of a baked constant.
 """
 
 from dataclasses import dataclass
@@ -48,7 +56,36 @@ class SegmentMask:
         return xp.where(keep, 1.0, 0.0)
 
 
-class SemiCoherentStatistic(LISAToolsParallelModule):
+class Statistic(LISAToolsParallelModule):
+    """Base of every detection statistic: ``evaluate(prepare(data), track)``.
+
+    Subclasses implement :meth:`prepare` (which array of a data container they
+    read) and :meth:`evaluate`; ``force_backend`` is ``"cpu"`` (NumPy) or
+    ``"jax"``.
+    """
+
+    @classmethod
+    def supported_backends(cls):
+        return [cls._BACKEND_PREFIX + "_" + t for t in ("cpu", "jax")]
+
+    @property
+    def is_jax(self) -> bool:
+        return self.backend.name.endswith("jax")
+
+    def to_backend(self, arr):
+        """Move a complex data array to this backend."""
+        return self.xp.asarray(np.asarray(arr), dtype=complex)
+
+    def prepare(self, data):
+        """The array of ``data`` that :meth:`evaluate` reads, on this backend."""
+        raise NotImplementedError
+
+    def evaluate(self, arr, track: Track):
+        """Score ``track`` against ``arr`` (from :meth:`prepare`)."""
+        raise NotImplementedError
+
+
+class SemiCoherentStatistic(Statistic):
     """Base: ``0.5 * sum_{channel, segment} w_alpha |<d|h_alpha>|^2 / <h_alpha|h_alpha>``.
 
     Args:
@@ -68,21 +105,13 @@ class SemiCoherentStatistic(LISAToolsParallelModule):
         self.first_bin = int(first_bin)
 
     @classmethod
-    def supported_backends(cls):
-        return [cls._BACKEND_PREFIX + "_" + t for t in ("cpu", "jax")]
-
-    @classmethod
     def for_data(cls, data, **kwargs):
         """Statistic on the grid, band and PSD of an :class:`~.data.SFTData`."""
         return cls(data.T_sft, data.psd, first_bin=data.first_bin, **kwargs)
 
-    @property
-    def is_jax(self) -> bool:
-        return self.backend.name.endswith("jax")
-
-    def to_backend(self, sfts):
-        """Move an SFT array ``(n_channels, n_segments, n_bins)`` to this backend."""
-        return self.xp.asarray(np.asarray(sfts), dtype=complex)
+    def prepare(self, data):
+        """The SFTs of an :class:`~.data.SFTData`, ``(n_channels, n_segments, n_bins)``."""
+        return self.to_backend(data.sfts)
 
     def segment_terms(self, sfts, track: Track):
         """Per-segment ``|<d|h>|``, shape ``(n_channels, n_segments)``, and ``<h|h>``,
