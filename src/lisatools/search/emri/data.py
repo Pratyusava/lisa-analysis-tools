@@ -61,7 +61,17 @@ class SFTData:
         return asnumpy(self.signal.t_arr)
 
     @classmethod
-    def from_timeseries(cls, data, dt, T_sft, psd, window_alpha=0.2, min_freq=0.0, max_freq=None):
+    def from_timeseries(
+        cls,
+        data,
+        dt,
+        T_sft,
+        psd,
+        window_alpha=0.2,
+        min_freq=0.0,
+        max_freq=None,
+        n_segments=None,
+    ):
         """Segment a time series into Tukey-windowed SFTs.
 
         Grid from :func:`~lisatools.domains.get_stft_settings`: whole segments
@@ -74,8 +84,18 @@ class SFTData:
             T_sft: Segment duration [s].
             psd: One-sided PSD callable.
             window_alpha: Tukey taper fraction per segment.
+            n_segments: Keep only the first ``n_segments`` segments (the data
+                stream that ends there); ``None`` keeps every whole segment.
         """
         data = np.atleast_2d(np.asarray(data, dtype=float))
+        if n_segments is not None:
+            nperseg = int(T_sft / dt)  # get_stft_settings' snapping
+            available = data.shape[-1] // nperseg
+            if not 0 < n_segments <= available:
+                raise ValueError(
+                    f"n_segments must be in [1, {available}] for this series, not {n_segments}."
+                )
+            data = data[..., : int(n_segments) * nperseg]
         td = TDSignal(data, TDSettings(data.shape[-1], dt, force_backend="cpu"))
         settings = get_stft_settings(
             np.arange(data.shape[-1]) * dt,

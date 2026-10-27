@@ -29,6 +29,7 @@ from lisatools.search.emri import (
     Adam,
     AdamDE,
     DifferentialEvolution,
+    EMRIInjection,
     EMRISearch,
     FresnelStatistic,
     SensitivityPSD,
@@ -285,6 +286,67 @@ class DataTest(unittest.TestCase):
         self.assertFalse(np.array_equal(a, c))
         self.assertFalse(np.array_equal(a[0], a[1]))
         np.testing.assert_array_equal(np.random.get_state()[1], before)
+
+    def test_first_n_segments(self):
+        x = np.random.default_rng(2).normal(size=int(N_SEG * T_SFT / DT) + 123)
+        full = SFTData.from_timeseries(x, DT, T_SFT, toy_psd())
+        head = SFTData.from_timeseries(x, DT, T_SFT, toy_psd(), n_segments=10)
+        self.assertEqual(head.n_segments, 10)
+        np.testing.assert_array_equal(head.sfts, full.sfts[:, :10])
+        np.testing.assert_array_equal(head.t_alpha, full.t_alpha[:10])
+        for bad in (0, N_SEG + 1):
+            with self.assertRaisesRegex(ValueError, "n_segments"):
+                SFTData.from_timeseries(x, DT, T_SFT, toy_psd(), n_segments=bad)
+
+
+class InjectionStreamTest(unittest.TestCase):
+    """EMRIInjection's data streams on a synthetic chirp (no FEW needed)."""
+
+    def setUp(self):
+        signal = chirp_timeseries(chirp_track(), 1e-20)[None]
+        self.inj = EMRIInjection(signal, DT, {}, 30.0, "A", toy_psd())
+
+    def test_frozen_noise_is_shared_by_every_stream(self):
+        inj = self.inj.with_noise(rng=7)
+        self.assertIsNone(self.inj.noise)  # the original is unchanged
+        np.testing.assert_array_equal(inj.noise, self.inj.draw_noise(rng=7))
+        self.assertEqual(inj.n_segments(T_SFT), N_SEG)
+        full = inj.sft_data(T_SFT)
+        np.testing.assert_array_equal(inj.sft_data(T_SFT, n_segments=10).sfts, full.sfts[:, :10])
+        np.testing.assert_array_equal(inj.sft_data(T_SFT).sfts, full.sfts)  # no new draw
+        np.testing.assert_array_equal(
+            full.sfts, SFTData.from_timeseries(inj.signal + inj.noise, DT, T_SFT, inj.psd).sfts
+        )
+
+    def test_signal_and_noise_parts_add_up(self):
+        inj = self.inj.with_noise(rng=7)
+        both, sig, noi = (
+            inj.sft_data(T_SFT, signal=s, noise=n)
+            for s, n in ((True, True), (True, False), (False, True))
+        )
+        np.testing.assert_allclose(
+            both.sfts, sig.sfts + noi.sfts, rtol=0, atol=1e-12 * np.abs(both.sfts).max()
+        )
+        explicit = self.inj.sft_data(T_SFT, noise=inj.noise)
+        np.testing.assert_array_equal(explicit.sfts, both.sfts)
+
+    def test_fresh_draws_without_frozen_noise(self):
+        a = self.inj.timeseries(rng=1)
+        np.testing.assert_array_equal(a, self.inj.timeseries(rng=1))
+        self.assertFalse(np.array_equal(a, self.inj.timeseries(rng=2)))
+
+    def test_bad_requests_raise(self):
+        with self.assertRaisesRegex(ValueError, "Nothing"):
+            self.inj.timeseries(signal=False, noise=False)
+        with self.assertRaisesRegex(ValueError, "shape"):
+            self.inj.with_noise(noise=np.zeros(5))
+        with self.assertRaisesRegex(ValueError, "PSD"):
+            EMRIInjection(self.inj.signal, DT, {}, 30.0).draw_noise()
+
+    def test_pickles_with_noise(self):
+        inj = self.inj.with_noise(rng=7)
+        clone = pickle.loads(pickle.dumps(copy.deepcopy(inj)))
+        np.testing.assert_array_equal(clone.sft_data(T_SFT).sfts, inj.sft_data(T_SFT).sfts)
 
 
 class StatisticTest(unittest.TestCase):

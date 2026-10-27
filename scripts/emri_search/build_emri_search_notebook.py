@@ -73,12 +73,10 @@ from lisatools.search.emri import (
     FresnelStatistic,
     SegmentMask,
     SensitivityPSD,
-    SFTData,
     SVDBasis,
     SVDTrackModel,
     Track,
     band_snr,
-    gaussian_noise,
 )
 from lisatools.utils.constants import YRSID_SI
 
@@ -292,17 +290,19 @@ $$
 $h \to h\,\rho_{\rm target}/\rho$ and $d_L \to d_L\,\rho/\rho_{\rm target}$; the scaled signal is then cut to $T_{\rm data}$.
 The PSD is the paper's tabulated TDI2 A/E curve, raised to its first value below its minimum and held constant below $10^{-4}$ Hz.
 (LAT's analytic `SensitivityPSD()` also works, with `snr_band=(0, 0.025)`: its transfer-function zeros near 0.03 Hz would dominate the full-band sum.)
+
+The injector returns an `EMRIInjection` (signal, parameters, PSD). `with_noise(rng)` returns a copy carrying one fixed
+Gaussian realisation $n(t)$ with PSD $S_n$, so the data are $d(t) = h(t) + n(t)$, and every stream taken from that
+object below (each duration, with or without the signal) shares the same $n(t)$, as in the paper.
 """)
 
 code(r"""
 psd = SensitivityPSD.from_file(PSD_FILE)
 injector = FEWInjector(T_SNR, dt=DT, channels=CHANNELS)
 injection = injector(SOURCE, SNR, psd, T_data=T_DATA, rng=np.random.default_rng(SOURCE_SEED))
-signal = injection.signal[0]
-noise = gaussian_noise(signal.size, DT, psd, rng=np.random.default_rng(NOISE_SEED))[0]
-data_td = signal + noise
+injection = injection.with_noise(rng=np.random.default_rng(NOISE_SEED))   # d = h + n, n fixed from here on
 print(elapsed(), "injection:", {k: round(v, 4) if isinstance(v, float) else v for k, v in injection.params.items()})
-print(f"SNR of the analysed {T_DATA} yr: {band_snr(signal, DT, psd):.2f}  (target {SNR} over {T_SNR} yr)")
+print(f"SNR of the analysed {T_DATA} yr: {band_snr(injection.signal, DT, psd):.2f}  (target {SNR} over {T_SNR} yr)")
 """)
 
 # --------------------------------------------------------------------------- SFTs
@@ -316,20 +316,15 @@ $$
 \tilde d_\alpha[k] = \Delta t \sum_{j=0}^{N_s - 1} w_j\, d(t_\alpha + j\Delta t)\, e^{-2\pi i jk/N_s},
 \qquad N_s = T_{\rm SFT}/\Delta t, \qquad f_k = k/T_{\rm SFT}.
 $$
+
+`injection.sft_data(T_SFT, signal=..., noise=..., n_segments=n)` returns these as an `SFTData` for the stream of the
+first $n$ segments: signal + noise (default), signal only (`noise=False`) or noise only (`signal=False`).
 """)
 
 code(r"""
-N_PER_SEG = int(T_SFT / DT)
-N_SEG_TOTAL = data_td.size // N_PER_SEG
-
-
-def sft_data(series, n_seg):
-    # SFTs of the first n_seg segments of a time series.
-    return SFTData.from_timeseries(series[: n_seg * N_PER_SEG], DT, T_SFT, psd, window_alpha=WINDOW_ALPHA)
-
-
-full = sft_data(data_td, N_SEG_TOTAL)
-signal_only = sft_data(signal, N_SEG_TOTAL)
+full = injection.sft_data(T_SFT, window_alpha=WINDOW_ALPHA)                    # h + n
+signal_only = injection.sft_data(T_SFT, noise=False, window_alpha=WINDOW_ALPHA)  # h
+N_SEG_TOTAL = full.n_segments
 print(f"{full.n_segments} segments x {full.sfts.shape[-1]} bins (df = {1 / T_SFT:.1e} Hz)")
 
 fig, ax = plt.subplots(1, 2, figsize=(11, 3.5), sharey=True)
@@ -523,9 +518,10 @@ def make_optimizer():
     )
 
 
-def search_stream(series, n_seg, seed):
-    # Best track for the first n_seg segments of `series`, plunge at the end of the stream.
-    data = sft_data(series, n_seg)
+def search_stream(stream, n_seg, seed, signal=True):
+    # Best track for the first n_seg segments of `stream` (an EMRIInjection with fixed noise),
+    # plunge at the end of the stream; signal=False searches its noise alone.
+    data = stream.sft_data(T_SFT, signal=signal, n_segments=n_seg, window_alpha=WINDOW_ALPHA)
     stat = FresnelStatistic.for_data(data, P=P, mask=MASK, force_backend="jax")
     model = SVDTrackModel(basis, data.t_alpha, T_ref=T_REF, force_backend="jax")
     search = EMRISearch(data, stat, model, make_optimizer(), n_initial=N_INITIAL,
@@ -544,7 +540,7 @@ statistic of the true track on the same stream.
 code(r"""
 injection_results = {}
 for k, n_seg in enumerate(DURATIONS):
-    res, data_k, stat_k = search_stream(data_td, n_seg, seed=SEARCH_SEED + k)
+    res, data_k, stat_k = search_stream(injection, n_seg, seed=SEARCH_SEED + k)
     tt = Track(true_track.f[:n_seg], true_track.fdot[:n_seg], true_track.fddot[:n_seg])
     s_true = float(stat_k.evaluate(stat_k.to_backend(data_k.sfts), tt))
     injection_results[n_seg] = dict(result=res, true_statistic=s_true)
@@ -610,9 +606,9 @@ of injections detected (paper Eqs. 12–13). With the toy's `N_NOISE = 4` the fi
 code(r"""
 noise_statistics = np.zeros((N_NOISE, len(DURATIONS)))
 for r in range(N_NOISE):
-    noise_r = gaussian_noise(signal.size, DT, psd, rng=np.random.default_rng(10_000 + r))[0]
+    noise_r = injection.with_noise(rng=np.random.default_rng(10_000 + r))   # a new n(t), same grid
     for k, n_seg in enumerate(DURATIONS):
-        res, _, _ = search_stream(noise_r, n_seg, seed=SEARCH_SEED + 1000 * (r + 1) + k)
+        res, _, _ = search_stream(noise_r, n_seg, seed=SEARCH_SEED + 1000 * (r + 1) + k, signal=False)
         noise_statistics[r, k] = res.best_statistic
     print(f"{elapsed()} noise run {r + 1}/{N_NOISE}: max S = {noise_statistics[r].max():.1f}")
 np.savez(os.path.join(RESULTS_DIR, "background.npz"), durations=DURATIONS, best_statistic=noise_statistics)

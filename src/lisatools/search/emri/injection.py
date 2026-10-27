@@ -18,7 +18,7 @@ The SNR sums every rFFT bin of the injected duration (EMRI-Search's
 """
 
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
 
 import numpy as np
@@ -75,7 +75,14 @@ def band_snr(data, dt, psd, band=(0.0, None)):
 
 @dataclass
 class EMRIInjection:
-    """A scaled injection and the parameters that produce it.
+    """A scaled injection, the parameters that produce it, and optionally one
+    fixed noise realisation.
+
+    The data streams of a search are built from it: :meth:`timeseries` (signal,
+    noise, or both) and :meth:`sft_data` (their SFTs, optionally only the first
+    ``n_segments``). :meth:`with_noise` freezes a noise draw, so every stream
+    taken from the returned injection (each duration, with or without the
+    signal) shares it.
 
     Attributes:
         signal: TDI time series, shape ``(n_channels, N)``.
@@ -85,6 +92,9 @@ class EMRIInjection:
             [Gpc] at the target SNR, and the angles.
         snr: SNR of the generated signal before trimming (the target).
         channels: Channel names of ``signal``'s rows.
+        psd: PSD the SNR was scaled with; the default for noise and whitening.
+        noise: Fixed noise realisation, shape of ``signal``; ``None`` until
+            :meth:`with_noise`.
     """
 
     signal: np.ndarray
@@ -93,31 +103,106 @@ class EMRIInjection:
     snr: float
     channels: str = "A"
     psd: Optional[Callable] = field(default=None, repr=False)
+    noise: Optional[np.ndarray] = field(default=None, repr=False)
+
+    def __post_init__(self):
+        if self.noise is not None:
+            self.noise = self._check_noise(self.noise)
 
     @property
     def times(self) -> np.ndarray:
         return np.arange(self.signal.shape[-1]) * self.dt
 
-    def sft_data(self, T_sft, psd=None, noise=True, rng=None, window_alpha=0.2, **kwargs):
-        """SFTs of the injection, plus Gaussian noise when ``noise`` is set.
+    def n_segments(self, T_sft) -> int:
+        """Whole ``T_sft`` segments in the signal (the most :meth:`sft_data` keeps)."""
+        return self.signal.shape[-1] // int(T_sft / self.dt)
+
+    def draw_noise(self, rng=None, psd=None) -> np.ndarray:
+        """A fresh :func:`~.data.gaussian_noise` realisation shaped like ``signal``.
+
+        Args:
+            rng: As in :func:`~.data.gaussian_noise` (``None``: NumPy's global RNG).
+            psd: Noise PSD; ``None`` uses :attr:`psd`.
+        """
+        psd = self._psd(psd)
+        n_channels, n_samples = self.signal.shape
+        return gaussian_noise(n_samples, self.dt, psd, n_channels=n_channels, rng=rng)
+
+    def with_noise(self, rng=None, noise=None, psd=None) -> "EMRIInjection":
+        """Copy of this injection carrying one fixed noise realisation.
+
+        Args:
+            rng: Generator / seed of the draw (:meth:`draw_noise`).
+            noise: Use this realisation instead of drawing one.
+            psd: Noise PSD of the draw; ``None`` uses :attr:`psd`.
+        """
+        if noise is None:
+            noise = self.draw_noise(rng, psd)
+        return replace(self, noise=noise)
+
+    def timeseries(self, signal=True, noise=True, rng=None, psd=None) -> np.ndarray:
+        """Data time series, shape ``(n_channels, N)``.
+
+        Args:
+            signal: Include the injected signal.
+            noise: ``True`` adds :attr:`noise` when set, else a fresh draw from
+                ``rng`` (and ``psd``); ``False`` none; an array adds that
+                realisation.
+        """
+        if not signal and noise is False:
+            raise ValueError("Nothing to return: signal=False and noise=False.")
+        out = self.signal if signal else np.zeros_like(self.signal)
+        if noise is True:
+            noise = self.noise if self.noise is not None else self.draw_noise(rng, psd)
+        if noise is not False:
+            out = out + self._check_noise(noise)
+        return out
+
+    def sft_data(
+        self,
+        T_sft,
+        psd=None,
+        signal=True,
+        noise=True,
+        rng=None,
+        n_segments=None,
+        window_alpha=0.2,
+        **kwargs,
+    ) -> SFTData:
+        """SFTs of :meth:`timeseries` (``signal`` / ``noise`` / ``rng`` as there).
 
         Args:
             T_sft: Segment duration [s].
-            psd: PSD of the noise and the whitening; ``None`` uses the one the
-                SNR was scaled with.
-            noise: Add a :func:`~.data.gaussian_noise` realisation (``rng`` as
-                there; ``None`` draws from NumPy's global RNG).
-            **kwargs: Forwarded to :meth:`~.data.SFTData.from_timeseries`.
+            psd: PSD of a fresh noise draw and of the whitening; ``None`` uses
+                :attr:`psd`.
+            n_segments: Keep the first ``n_segments`` segments only (the data
+                stream ending there); ``None`` keeps them all.
+            **kwargs: Forwarded to :meth:`~.data.SFTData.from_timeseries`
+                (``min_freq``, ``max_freq``).
         """
-        psd = self.psd if psd is None else psd
-        data = self.signal
-        if noise:
-            data = data + gaussian_noise(
-                data.shape[-1], self.dt, psd, n_channels=data.shape[0], rng=rng
-            )
+        psd = self._psd(psd)
+        data = self.timeseries(signal=signal, noise=noise, rng=rng, psd=psd)
         return SFTData.from_timeseries(
-            data, self.dt, T_sft, psd, window_alpha=window_alpha, **kwargs
+            data,
+            self.dt,
+            T_sft,
+            psd,
+            window_alpha=window_alpha,
+            n_segments=n_segments,
+            **kwargs,
         )
+
+    def _psd(self, psd):
+        psd = self.psd if psd is None else psd
+        if psd is None:
+            raise ValueError("No PSD: pass psd= (the injection was made without one).")
+        return psd
+
+    def _check_noise(self, noise):
+        noise = np.atleast_2d(np.asarray(noise, dtype=float))
+        if noise.shape != self.signal.shape:
+            raise ValueError(f"noise has shape {noise.shape}, signal {self.signal.shape}.")
+        return noise
 
 
 class FEWInjector:
