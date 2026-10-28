@@ -350,6 +350,49 @@ print(elapsed(), "injection:", {k: round(v, 4) if isinstance(v, float) else v fo
 print(f"SNR of the analysed {T_DATA} yr: {band_snr(injection.signal, DT, psd):.2f}  (target {SNR} over {T_SNR} yr)")
 """)
 
+md(r"""
+**The injected waveform.** Top: the A-channel signal $h_A(t)$ over the analysed stream (the noise is far larger
+sample by sample, so it is not drawn), and one hour at the start and one hour before plunge, where the frequency and amplitude have grown.
+Bottom: the signal's characteristic strain $h_c = 2f\,\lvert\tilde h(f)\rvert$ against the noise amplitude
+$h_n = \sqrt{f\,S_n(f)}$. Their ratio integrates to the SNR,
+$$\rho^2 = \int \Big(\frac{h_c}{h_n}\Big)^2 d\ln f = 4\int \frac{\lvert\tilde h\rvert^2}{S_n}\,df ,$$
+so the height of the signal above the noise curve, over the band it spans, is what the search accumulates.
+The steps are the harmonics $m\,\Phi_\phi$ ($m = 1, 2, 3, \dots$) sweeping their bands; the search follows $m = 2$.
+""")
+
+code(r"""
+h_A = injection.signal[0]
+t_days = injection.times / 86400
+t_plunge = T_PL * YRSID_SI / 86400
+fd_sig = injection.fd_data(noise=False, min_freq=1e-4, max_freq=5e-2)
+
+fig = plt.figure(figsize=(13, 7))
+gs = fig.add_gridspec(2, 3)
+ax = fig.add_subplot(gs[0, 0])
+step = max(1, h_A.size // 200_000)
+ax.plot(t_days[::step], h_A[::step], lw=0.3)
+ax.axvline(t_plunge, color="k", ls=":", lw=0.8, label="plunge")
+ax.set_xlabel("t [d]"); ax.set_ylabel(r"$h_A(t)$"); ax.set_title("A channel, analysed stream", pad=14); ax.legend()
+in_band = np.flatnonzero(np.abs(h_A) > 0)
+hour = 1 / 24
+for col, (t0, title) in enumerate(((t_days[in_band[0]], "first hour"),
+                                   (min(t_plunge, t_days[in_band[-1]]) - hour, "last hour before plunge")), start=1):
+    ax = fig.add_subplot(gs[0, col])
+    sel = (t_days >= t0) & (t_days < t0 + hour)
+    ax.plot((t_days[sel] - t0) * 1440, h_A[sel], lw=0.8)
+    ax.set_xlabel(f"t - {t0:.2f} d [min]"); ax.set_title(title, pad=14)
+ax = fig.add_subplot(gs[1, :])
+f = fd_sig.freqs
+h_c, h_n = 2 * f * np.abs(fd_sig.fd[0]), np.sqrt(f * psd(f))
+ax.loglog(f, h_n, "k", lw=1.2, label=r"noise $h_n = \sqrt{f S_n(f)}$")
+ax.loglog(f, h_c, "C1", lw=0.6, label=r"signal $h_c = 2f|\tilde h(f)|$")
+ax.set_xlim(1e-4, 5e-2); ax.set_ylim(h_n.min() / 10, None)
+ax.set_xlabel("f [Hz]"); ax.set_ylabel("characteristic strain"); ax.legend(loc="lower left")
+snr_check = np.sqrt(4 * np.sum(np.abs(fd_sig.fd[0]) ** 2 / psd(f)) * fd_sig.df)
+ax.set_title(f"spectrum of the analysed stream (SNR from the curves: {snr_check:.1f})")
+plt.tight_layout()
+""")
+
 # --------------------------------------------------------------------------- SFTs
 md(r"""
 ## 3. Short Fourier transforms
