@@ -128,11 +128,13 @@ class FDData:
         signal: The FFT over the settings' active band, shape ``(n_channels, n_bins)``.
         psd: One-sided PSD callable ``psd(f)``, the same for every channel.
         dt: Sampling cadence of the underlying time series [s].
+        window_alpha: Tukey taper fraction of the stream (0: rectangular).
     """
 
     signal: FDSignal
     psd: Callable
     dt: float
+    window_alpha: float = 0.01
 
     @property
     def fd(self) -> np.ndarray:
@@ -161,8 +163,19 @@ class FDData:
         return asnumpy(self.signal.f_arr)
 
     @classmethod
-    def from_timeseries(cls, data, dt, psd, min_freq=0.0, max_freq=None, duration=None):
-        """``dt * rfft`` of a time series, keeping the bins in ``[min_freq, max_freq]``.
+    def from_timeseries(
+        cls, data, dt, psd, min_freq=0.0, max_freq=None, duration=None, window_alpha=0.01
+    ):
+        """``dt * rfft(w * x) / rms(w)`` of a time series, keeping the bins in
+        ``[min_freq, max_freq]``.
+
+        The FFT treats the stream as periodic, so an untapered stream that does
+        not wrap smoothly (any stream cut out of a longer one) has a step at
+        ``t = 0 = T``. Whitened, the step of the steep low-frequency noise is a
+        loud broadband transient at delay 0, which coherent statistics that
+        scan delays (:class:`~.excess_power.ExcessPowerStatistic`) pick up. A
+        Tukey taper ``w`` removes it; dividing by ``rms(w)`` keeps the
+        whitened noise power at 2 per bin.
 
         Args:
             data: Real time series, shape ``(N,)`` or ``(n_channels, N)``.
@@ -170,6 +183,7 @@ class FDData:
             psd: One-sided PSD callable.
             duration: Keep the first ``int(duration / dt)`` samples only (the
                 stream that ends there) [s]; ``None`` keeps them all.
+            window_alpha: Tukey taper fraction (0: rectangular).
         """
         data = np.atleast_2d(np.asarray(data, dtype=float))
         if duration is not None:
@@ -180,11 +194,14 @@ class FDData:
                 )
             data = data[..., :n]
         n = data.shape[-1]
+        if window_alpha > 0:
+            w = tukey(n, window_alpha)
+            data = data * (w / np.sqrt(np.mean(w**2)))
         settings = FDSettings(
             n // 2 + 1, 1.0 / (n * dt), min_freq=min_freq, max_freq=max_freq, force_backend="cpu"
         )
         td = TDSignal(data, TDSettings(n, dt, force_backend="cpu"))
-        return cls(td.fft(settings=settings), psd=psd, dt=dt)
+        return cls(td.fft(settings=settings), psd=psd, dt=dt, window_alpha=window_alpha)
 
 
 def gaussian_noise(n_samples, dt, psd, n_channels=1, rng=None):

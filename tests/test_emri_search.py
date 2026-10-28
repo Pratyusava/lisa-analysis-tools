@@ -900,7 +900,7 @@ class ExcessPowerTest(unittest.TestCase):
 
     def test_fd_data_matches_rfft(self):
         x = np.random.default_rng(3).normal(size=self.n + 17)
-        d = self.fd(x, duration=10 * T_SFT)
+        d = self.fd(x, duration=10 * T_SFT, window_alpha=0.0)
         n = int(10 * T_SFT / DT)
         ref = DT * np.fft.rfft(x[:n])
         self.assertAlmostEqual(d.T, 10 * T_SFT)
@@ -908,6 +908,26 @@ class ExcessPowerTest(unittest.TestCase):
         np.testing.assert_allclose(d.freqs, (d.first_bin + np.arange(d.n_bins)) / d.T)
         with self.assertRaisesRegex(ValueError, "duration"):
             self.fd(x, duration=2 * self.n * DT)
+
+    def test_taper_removes_cut_transient(self):
+        """A stream cut from a longer one: untapered, the step at the FFT's wrap
+        is a whitened red-noise transient that H picks up (seed with a large
+        step); the default taper removes it and keeps the noise mean at 2."""
+        n, t = self.n, self.t_alpha
+        fdot = (1e-3 - 3.2e-4) / t[-1]
+        track = Track(3.2e-4 + fdot * t, np.full(N_SEG, fdot))
+        x = gaussian_noise(4 * n, DT, self.psd, rng=1)
+        H = {}
+        for alpha in (0.0, 0.01):
+            d = FDData.from_timeseries(
+                x, DT, self.psd, min_freq=3e-4, max_freq=1e-2, duration=n * DT, window_alpha=alpha
+            )
+            stat = ExcessPowerStatistic.for_data(d, t, force_backend="cpu")
+            H[alpha] = float(stat.evaluate(stat.prepare(d), track))
+        self.assertGreater(H[0.0], 30.0)
+        self.assertLess(H[0.01], 10.0)
+        power = 4 * d.df * np.abs(d.fd[0]) ** 2 / self.psd(d.freqs)
+        self.assertAlmostEqual(power.mean(), 2.0, delta=0.05)
 
     def test_injection_fd_stream(self):
         signal = chirp_timeseries(chirp_track(), 1e-20)[None]
@@ -1007,6 +1027,48 @@ class ExcessPowerTest(unittest.TestCase):
             MatchedFilterStatistic.for_data(d, self.t_alpha, amplitude="x", force_backend="cpu")
         with self.assertRaisesRegex(ValueError, "normalization"):
             ExcessPowerStatistic.for_data(d, self.t_alpha, normalization="x", force_backend="cpu")
+        with self.assertRaisesRegex(ValueError, "uniformly"):
+            ExcessPowerStatistic.for_data(d, self.t_alpha**1.01, force_backend="cpu")
+
+    def test_folded_delay_transform(self):
+        """More bins than delays: the folded M-point transform is the direct
+        sum over every bin at tau_j = j T / M (and plain zero-padding when
+        there are fewer bins)."""
+        d = self.fd(np.zeros(self.n))
+        rng = np.random.default_rng(6)
+        for step in (200.0, 20.0):
+            stat = ExcessPowerStatistic.for_data(
+                d, self.t_alpha, delay_step=step, force_backend="cpu"
+            )
+            x = rng.normal(size=(2, d.n_bins)) + 1j * rng.normal(size=(2, d.n_bins))
+            j = rng.integers(0, stat.n_fft, 7)
+            k = np.arange(d.n_bins)
+            direct = x @ np.exp(2j * np.pi * np.outer(k, j) / stat.n_fft)
+            np.testing.assert_allclose(stat.delay_transform(x)[:, j], direct, rtol=1e-9)
+        self.assertGreater(d.n_bins, ExcessPowerStatistic.for_data(d, self.t_alpha).n_fft)
+
+    def test_template_matches_interp(self):
+        """The arithmetic bracketing of the bins equals np.interp's t(f) and
+        fdot(t(f)), on a track that also turns down (cummax plateau)."""
+        d = self.fd(np.zeros(self.n))
+        stat = ExcessPowerStatistic.for_data(d, self.t_alpha, force_backend="cpu")
+        t = self.t_alpha
+        f = 3e-3 + 2e-10 * t + 1.5e-3 * np.sin(t / t[-1] * 5.0)
+        track = Track(f, np.gradient(f, t))
+        A, psi, valid = stat.template(track)
+        self.assertTrue(valid)
+        dt = t[1] - t[0]
+        keep = stat.mask(track, dt, np) > 0
+        fk, fdk = np.where(keep, track.f, 0.0), np.where(keep, track.fdot, 0.0)
+        t1 = np.append(t, t[-1] + dt)
+        f_up = np.maximum.accumulate(np.append(fk, fk[-1] + fdk[-1] * dt))
+        t_k = np.interp(d.freqs, f_up, t1)
+        fdot_k = np.interp(t_k, t1, np.append(fdk, fdk[-1]))
+        inside = (d.freqs >= np.min(np.where(keep, f, np.inf))) & (d.freqs <= f_up[-1])
+        a = np.where(inside, 1 / np.sqrt(np.maximum(fdot_k, stat.fdot_floor)), 0.0)
+        a /= np.sqrt(4 * d.df * np.sum(a**2 / stat.psd_bins))
+        np.testing.assert_allclose(A, a, rtol=1e-10, atol=1e-12 * a.max())
+        np.testing.assert_allclose(psi, 2 * np.pi * d.df * (np.cumsum(t_k) - 0.5 * t_k), rtol=1e-12)
 
     def test_config_pickles(self):
         d = self.fd(np.zeros(self.n))

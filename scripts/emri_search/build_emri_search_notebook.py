@@ -222,6 +222,7 @@ md(r"""
 | `H_WINDOWS` | $W$ | Delay-window lengths $N\,\delta\tau$ that $H$ maximises over [s] |
 | `H_DELAY_STEP` | $\delta\tau$ | Target spacing of the delay grid [s] |
 | `H_NORMALIZATION` | $Q(N)$ | `"exact"`: finite-window variance per template; `"asymptotic"`: the draft's large-window $R = L/K$ |
+| `H_WINDOW_ALPHA` | | Tukey taper of the stream before its FFT. Each search duration cuts the stream, and the FFT wraps the cut end onto the start: untapered, that step in the steep low-frequency noise whitens into a loud transient at delay 0, which $H$ sums into values in the thousands on pure noise |
 """)
 
 code(r"""
@@ -232,6 +233,7 @@ H_BAND = (3e-4, 2e-2)
 H_WINDOWS = (2e3, 4.2e3, 1.72e4, 6.9e4)                   # CB-R draft: {10, 21, 86, 345} cells of ~200 s
 H_DELAY_STEP = 200.0                                      # CB-R draft: ~200 s
 H_NORMALIZATION = "exact"                                 # CB-R draft: "asymptotic"
+H_WINDOW_ALPHA = 0.01                                     # 0 = rectangular (do not: see the table)
 """)
 
 md(r"""
@@ -513,7 +515,7 @@ Each response is $(\text{value} - \mu_0)/\sigma_0$, with $\mu_0, \sigma_0$ from 
 """)
 
 code(r"""
-fd_full = injection.fd_data(min_freq=H_BAND[0], max_freq=H_BAND[1])
+fd_full = injection.fd_data(min_freq=H_BAND[0], max_freq=H_BAND[1], window_alpha=H_WINDOW_ALPHA)
 t_segments = full.t_alpha
 H_stat = ExcessPowerStatistic.for_data(fd_full, t_segments, windows=H_WINDOWS, delay_step=H_DELAY_STEP,
                                        normalization=H_NORMALIZATION, force_backend="cpu")
@@ -538,7 +540,8 @@ cal = []
 for r in range(N_CAL):
     noise_r = injection.with_noise(rng=np.random.default_rng(20_000 + r))
     cal.append(all_statistics(stat_full.prepare(noise_r.sft_data(T_SFT, signal=False, window_alpha=WINDOW_ALPHA)),
-                              H_stat.prepare(noise_r.fd_data(signal=False, min_freq=H_BAND[0], max_freq=H_BAND[1])),
+                              H_stat.prepare(noise_r.fd_data(signal=False, min_freq=H_BAND[0], max_freq=H_BAND[1],
+                                                                window_alpha=H_WINDOW_ALPHA)),
                               true_track))
 mu0, sigma0 = np.mean(cal, axis=0), np.std(cal, axis=0, ddof=1)
 sfts_arr, fd_arr = stat_full.prepare(full), H_stat.prepare(fd_full)
@@ -695,7 +698,8 @@ def make_data_and_statistic(stream, n_seg, signal=True, statistic=None, force_ba
     if statistic == "fresnel":
         data = stream.sft_data(T_SFT, signal=signal, n_segments=n_seg, window_alpha=WINDOW_ALPHA)
         return data, FresnelStatistic.for_data(data, P=P, mask=MASK, force_backend=force_backend), t_alpha
-    data = stream.fd_data(signal=signal, duration=n_seg * T_SFT, min_freq=H_BAND[0], max_freq=H_BAND[1])
+    data = stream.fd_data(signal=signal, duration=n_seg * T_SFT, min_freq=H_BAND[0], max_freq=H_BAND[1],
+                          window_alpha=H_WINDOW_ALPHA)
     stat = ExcessPowerStatistic.for_data(data, t_alpha, windows=H_WINDOWS, delay_step=H_DELAY_STEP,
                                          normalization=H_NORMALIZATION, force_backend=force_backend)
     return data, stat, t_alpha

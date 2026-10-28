@@ -212,7 +212,7 @@ class EMRIInjection:
             duration: Keep the first ``duration`` seconds only (the data stream
                 ending there, e.g. ``n_segments * T_sft``); ``None`` keeps all.
             **kwargs: Forwarded to :meth:`~.data.FDData.from_timeseries`
-                (``min_freq``, ``max_freq``).
+                (``min_freq``, ``max_freq``, ``window_alpha``).
         """
         psd = self._psd(psd)
         data = self.timeseries(signal=signal, noise=noise, rng=rng, psd=psd)

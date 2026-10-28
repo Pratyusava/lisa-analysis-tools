@@ -5,7 +5,14 @@ complex correlation with the data at every time delay ``tau_j``,
 
     rho_j = <d | h_{tau_j}> = 4 df sum_k conj(d_k) h_k e^{-2 pi i f_k tau_j} / S_k,
 
-and a statistic reduces ``|rho_j|^2`` over the delays:
+on the grid ``tau_j = j T / M``, ``j < M`` (circular, period ``T``), and a
+statistic reduces ``|rho_j|^2`` over the delays. ``M = T / delay_step`` is set
+by the delay resolution, not by the number of bins: when the band holds more
+bins than ``M``, the weighted spectrum is folded modulo ``M`` (bins ``k`` and
+``k + M`` share every ``e^{2 pi i k j / M}``) before an ``M``-point inverse FFT,
+which gives ``rho_j`` exactly at a cost set by ``M``.
+
+The statistics:
 
 * :class:`MatchedFilterStatistic` -- the phase- and delay-maximised matched
   filter ``max_j |rho_j|``;
@@ -44,12 +51,17 @@ class DelayCorrelationStatistic(Statistic):
     Args:
         T: Duration of the data stream [s] (``1 / df``).
         psd: One-sided PSD callable ``psd(f)``.
-        t_alpha: Times of the track samples [s] (the track model's grid).
+        t_alpha: Times of the track samples [s] (the track model's grid,
+            uniformly spaced).
         first_bin: Absolute bin index (``f / df``) of the data's first bin.
         n_bins: Number of stored bins.
         delay_step: Target delay resolution [s]; the inverse FFT has
-            ``max(n_bins, T / delay_step)`` points (rounded up to a fast size),
-            so the actual step :attr:`delay_step` is at most ``1 / bandwidth``.
+            ``T / delay_step`` points (rounded up to a fast size, so the
+            actual step :attr:`delay_step` is at most this). Delays finer than
+            ``1 / (template bandwidth)`` resolve a matched template's
+            correlation peak; a coarser grid samples it (the matched filter
+            then loses up to its peak's drop over half a step), while the
+            noise normalisation of :class:`ExcessPowerStatistic` stays exact.
         amplitude: ``"spa"`` (``|h(f)| ~ fdot^{-1/2}``) or ``"flat"``.
         mask: Which track samples enter the template (in band, chirping up).
             The default drops the semi-coherent linear-chirp cut, which does
@@ -80,6 +92,10 @@ class DelayCorrelationStatistic(Statistic):
         self.df = 1.0 / self.T
         self.psd = psd
         self.t_alpha = np.asarray(t_alpha, dtype=float)
+        if self.t_alpha.size > 2 and not np.allclose(
+            np.diff(self.t_alpha), self.t_alpha[1] - self.t_alpha[0], rtol=1e-9, atol=0.0
+        ):
+            raise ValueError("t_alpha must be uniformly spaced.")
         self.first_bin = int(first_bin)
         self.n_bins = int(n_bins)
         self.amplitude = amplitude
@@ -87,7 +103,7 @@ class DelayCorrelationStatistic(Statistic):
         self.fdot_floor = float(fdot_floor)
         self.freqs = (self.first_bin + np.arange(self.n_bins)) * self.df
         self.psd_bins = np.asarray(psd(self.freqs), dtype=float)
-        self.n_fft = next_fast_len(max(self.n_bins, int(np.ceil(self.T / float(delay_step)))))
+        self.n_fft = next_fast_len(int(np.ceil(self.T / float(delay_step))))
 
     @classmethod
     def for_data(cls, data, t_alpha, **kwargs):
@@ -104,6 +120,47 @@ class DelayCorrelationStatistic(Statistic):
     def prepare(self, data):
         """The band of an :class:`~.data.FDData`, ``(n_channels, n_bins)``."""
         return self.to_backend(data.fd)
+
+    def fold(self, x):
+        """``x`` along its last axis summed modulo ``M`` (= :attr:`n_fft`);
+        unchanged when it has at most ``M`` entries."""
+        m, n = self.n_fft, x.shape[-1]
+        if n <= m:
+            return x
+        n_fold = -(-n // m)
+        pad = [(0, 0)] * (x.ndim - 1) + [(0, n_fold * m - n)]
+        return self.xp.pad(x, pad).reshape(x.shape[:-1] + (n_fold, m)).sum(axis=-2)
+
+    def delay_transform(self, x):
+        """``M sum_k x_k e^{2 pi i k j / M}`` for every delay ``j < M``, along
+        the last axis: :meth:`fold`, then one ``M``-point inverse FFT."""
+        return self.xp.fft.ifft(self.fold(x), n=self.n_fft, axis=-1) * self.n_fft
+
+    def _bracket(self, f_up):
+        """For every bin ``f_k``: the knot interval ``i`` with
+        ``f_up[i] <= f_k < f_up[i + 1]`` (clipped to the ends) and the linear
+        weight in it, i.e. ``np.interp`` on non-decreasing knots. The bins are
+        a uniform grid, so each knot's first bin at or above it is arithmetic;
+        a cumulative count of those gives ``i`` without searching the bins."""
+        xp = self.xp
+        n, m = self.n_bins, f_up.shape[0]
+        pos = f_up / self.df - self.first_bin
+        if self.is_jax:
+            import jax
+
+            pos = jax.lax.stop_gradient(pos)
+        first = xp.clip(xp.ceil(pos), 0, n).astype(int)
+        if self.is_jax:
+            counts = xp.zeros(n + 1, dtype=int).at[first].add(1)
+        else:
+            counts = np.bincount(first, minlength=n + 1)
+        i = xp.clip(xp.cumsum(counts)[:n] - 1, 0, m - 2)
+        lo, hi = f_up[i], f_up[i + 1]
+        width = hi - lo
+        f_k = xp.asarray(self.freqs)
+        w = xp.clip((f_k - lo) / xp.where(width > 0, width, 1.0), 0.0, 1.0)
+        # a flat last interval: bins above it take the last knot, as np.interp
+        return i, xp.where(width > 0, w, (f_k >= hi).astype(float))
 
     def _cummax(self, x):
         if self.is_jax:
@@ -133,10 +190,11 @@ class DelayCorrelationStatistic(Statistic):
         f_lo = xp.min(xp.where(keep, track.f, xp.inf))
         inside = (f_k >= f_lo) & (f_k <= f_up[-1])
 
-        t_k = xp.interp(f_k, f_up, t)
+        i, w = self._bracket(f_up)
+        t_k = t[i] + w * (t[i + 1] - t[i])
         psi = 2 * np.pi * self.df * (xp.cumsum(t_k) - 0.5 * t_k)
         if self.amplitude == "spa":
-            fdot_k = xp.interp(t_k, t, fdot)
+            fdot_k = fdot[i] + w * (fdot[i + 1] - fdot[i])  # t is uniform: same weight
             a = 1.0 / xp.sqrt(xp.maximum(fdot_k, self.fdot_floor))
         else:
             a = xp.ones_like(f_k)
@@ -154,7 +212,7 @@ class DelayCorrelationStatistic(Statistic):
         xp = self.xp
         A, psi, valid = self.template(track)
         weight = 4 * self.df * A / xp.asarray(self.psd_bins) * xp.exp(1j * psi)
-        rho = xp.fft.ifft(arr * weight[None, :], n=self.n_fft, axis=-1) * self.n_fft
+        rho = self.delay_transform(arr * weight[None, :])
         return xp.sum(xp.abs(rho) ** 2, axis=0), (A, psi, valid)
 
     def reduce(self, power, template, n_channels):
@@ -186,8 +244,10 @@ class ExcessPowerStatistic(DelayCorrelationStatistic):
     template's delay autocorrelation ``a_m = <h_0|h_m>`` sets
     ``Q(N) = sum_{|m|<N} (1 - |m|/N) |a_m|^2``. ``normalization="exact"``
     (default) computes it per template (one more FFT); ``"asymptotic"`` uses
-    the large-window limit ``Q = n_fft sum_k b_k^2`` with
-    ``b_k = 4 df A_k^2 / S_k``, the draft's ``R = L / K`` for flat weights.
+    the large-window limit ``Q = sum_m |a_m|^2 = M sum_k' B_k'^2`` with
+    ``b_k = 4 df A_k^2 / S_k`` and ``B`` its fold modulo ``M``
+    (``n_fft sum_k b_k^2`` when the band has at most ``M`` bins), the draft's
+    ``R = L / K`` for flat weights.
     The limit needs windows much longer than the autocorrelation length,
     ~1 / (template bandwidth): true for the draft's templates spanning
     3-8 mHz, not for a track that spans a few bins, whose window sums it
@@ -218,9 +278,9 @@ class ExcessPowerStatistic(DelayCorrelationStatistic):
         xp = self.xp
         b = 4 * self.df * A**2 / xp.asarray(self.psd_bins)
         if self.normalization == "asymptotic":
-            q = self.n_fft * xp.sum(b**2)
+            q = self.n_fft * xp.sum(self.fold(b) ** 2)
             return [q for _ in self.cells]
-        a2 = xp.abs(xp.fft.ifft(b, n=self.n_fft) * self.n_fft) ** 2
+        a2 = xp.abs(self.delay_transform(b)) ** 2
         s0 = xp.cumsum(a2)
         s1 = xp.cumsum(xp.arange(self.n_fft) * a2)
         return [2 * (s0[n - 1] - s1[n - 1] / n) - a2[0] for n in self.cells]
