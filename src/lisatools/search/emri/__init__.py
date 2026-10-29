@@ -28,6 +28,7 @@ from .optimize import (  # noqa: F401
     population_evaluator,
     population_map,
 )
+from .parallel import SearchTask, portable_result, run_tasks  # noqa: F401
 from .pipeline import EMRISearch, SearchResult  # noqa: F401
 from .psd import SensitivityPSD, TabulatedNoiseModel  # noqa: F401
 from .statistic import (  # noqa: F401

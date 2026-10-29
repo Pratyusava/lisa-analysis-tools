@@ -189,15 +189,38 @@ class Optimizer:
     (:func:`population_evaluator`; ``None``: all at once). ``loss`` may be a
     :class:`BucketedLoss`.
 
+    ``patience`` stops early: after ``patience`` steps in which the best
+    loss has not dropped by more than ``min_improvement`` (relative) below the
+    last best that did; ``None`` (default) always runs ``n_steps``. The last
+    step run is ``history["last_step"]``.
+
     All randomness comes from the ``key`` passed to :meth:`run`.
     """
 
     n_steps: int = 200
     save_every: int = 10
     batch_size: Optional[int] = None
+    patience: Optional[int] = None
+    min_improvement: float = 1e-3
 
     def run(self, loss: Callable, x0, key) -> OptimizationResult:
         raise NotImplementedError
+
+    def _stopper(self):
+        """``done(step, fx) -> bool`` for one run (:attr:`patience`)."""
+        if self.patience is None:
+            return lambda step, fx: False
+        state = {"best": np.inf, "since": 0}
+
+        def done(step, fx):
+            best = float(np.min(np.asarray(fx)))
+            if best < state["best"] - self.min_improvement * abs(state["best"]) or step == 0:
+                state["best"], state["since"] = best, 0
+            else:
+                state["since"] += 1
+            return state["since"] >= self.patience
+
+        return done
 
 
 @dataclass
@@ -227,10 +250,14 @@ class DifferentialEvolution(_DEOptimizer):
         x = jnp.clip(jnp.asarray(x0), 0.0, 1.0)
         fx = batch_loss(x)
         history = _new_history()
+        done = self._stopper()
         for step in range(self.n_steps + 1):
             key, *keys = jax.random.split(key, 3)
             x, fx, improved = self._de_step(keys, x, fx, batch_loss)
-            _record(history, step, self.save_every, x, fx, improved)
+            stop = done(step, fx) or step == self.n_steps
+            _record(history, step, self.save_every, x, fx, improved, last=stop)
+            if stop:
+                break
         return OptimizationResult(x, fx, history)
 
 
@@ -272,24 +299,30 @@ class AdamDE(_DEOptimizer):
         x = jnp.asarray(x0)
         state = jax.vmap(self.adam.init)(x)
         history = _new_history()
+        done = self._stopper()
         for step in range(self.n_steps + 1):
             key, *keys = jax.random.split(key, 3)
             x, state, fx = adam_step(x, state)
             if not self.stale_selection:
                 fx = batch_loss(x)
             x, fx, improved = self._de_step(keys, x, fx, batch_loss)
-            _record(history, step, self.save_every, x, fx, improved)
+            stop = done(step, fx) or step == self.n_steps
+            _record(history, step, self.save_every, x, fx, improved, last=stop)
+            if stop:
+                break
         if self.stale_selection:
             fx = batch_loss(x)  # rejected members kept their pre-Adam scores
         return OptimizationResult(x, fx, history)
 
 
 def _new_history():
-    return {"step": [], "loss": [], "x": [], "improved_fraction": []}
+    return {"step": [], "loss": [], "x": [], "improved_fraction": [], "last_step": None}
 
 
-def _record(history, step, every, x, fx, improved):
-    if step % every:
+def _record(history, step, every, x, fx, improved, last=False):
+    if last:
+        history["last_step"] = step
+    if step % every and not last:
         return
     order = np.argsort(np.asarray(fx))
     history["step"].append(step)

@@ -74,10 +74,12 @@ from lisatools.search.emri import (
     FEWInjector,
     FresnelStatistic,
     MatchedFilterStatistic,
+    SearchTask,
     SegmentMask,
     SensitivityPSD,
     SVDBasis,
     SVDTrackModel,
+    run_tasks,
     Track,
     band_snr,
 )
@@ -248,6 +250,7 @@ md(r"""
 | `N_INITIAL` | | Space-filling initial draws, screened by the statistic |
 | `N_POPULATION` | $N_p$ | Best initial draws kept and optimised |
 | `N_STEPS` | | Adam + DE iterations (the loop runs `N_STEPS + 1` times, as Lorenzo's) |
+| `PATIENCE`, `MIN_IMPROVEMENT` | | Stop an optimisation early once its best statistic has not grown by more than `MIN_IMPROVEMENT` (relative) for `PATIENCE` iterations; `PATIENCE = None` always runs `N_STEPS` |
 | `LEARNING_RATE` | $\eta$ | Adam step size in unit-cube coordinates |
 | `F_RANGE` | $[F_{\min}, F_{\max}]$ | DE differential weight $F \sim U(F_{\min}, F_{\max})$ per iteration |
 | `P_ELITISM` | $p_e$ | Probability that the DE base vector is the fittest member |
@@ -265,6 +268,8 @@ DURATION_STEP = 12          # PAPER: 12 segments  (48 durations for 1 yr)
 N_INITIAL = __N_INITIAL__   # PAPER: 1024; REPO (QuickStart): 128
 N_POPULATION = __N_POP__    # PAPER: 512;  REPO (QuickStart): 64
 N_STEPS = __N_STEPS__       # PAPER: 525;  REPO (QuickStart): 200
+PATIENCE = 50               # PAPER / REPO: None (fixed N_STEPS)
+MIN_IMPROVEMENT = 1e-3
 LEARNING_RATE = 1e-5        # PAPER / REPO: 1e-5
 F_RANGE = (0.3, 1.5)        # PAPER / REPO
 P_ELITISM = 0.5             # REPO (np.random.choice([True, False])); not stated in the paper
@@ -307,6 +312,7 @@ optimiser seeds, same budget), and its detections are thresholded on its **own**
 | `LOC_TOL_BINS`, `LOC_FRACTION` | A run is *localised* when its best track is within `LOC_TOL_BINS` / $T_{\rm SFT}$ of the true m=2 track on at least `LOC_FRACTION` of the in-band segments |
 | `COMPARE_P_FA` | False-alarm probability of the detection threshold |
 | `COMPARE_RESUME` | Reuse `compare_<statistic>.npz` in `RESULTS_DIR` when present (restart a long run where it stopped) |
+| `N_WORKERS` | Optimisations run side by side in separate processes (`lisatools.search.emri.run_tasks`). One JAX process keeps only ~4 of 12 cores busy, so a few workers raise throughput; each holds its own data and compiled functions, so memory grows with it. Results are identical to `N_WORKERS = 1` |
 """)
 
 code(r"""
@@ -320,6 +326,7 @@ LOC_TOL_BINS = 2.0
 LOC_FRACTION = 0.9
 COMPARE_P_FA = 1e-2                # CB-R draft: empirical 1% per search
 COMPARE_RESUME = True
+N_WORKERS = 1                      # 18 GB laptop: 1;  M5 Max: 3-4 (check memory with one run first)
 """)
 
 # --------------------------------------------------------------------------- injection
@@ -688,6 +695,8 @@ def make_optimizer():
         p_elitism=P_ELITISM,
         save_every=10,
         batch_size=BATCH_SIZE,
+        patience=PATIENCE,
+        min_improvement=MIN_IMPROVEMENT,
     )
 
 
@@ -707,14 +716,20 @@ def make_data_and_statistic(stream, n_seg, signal=True, statistic=None, force_ba
     return data, stat, t_alpha
 
 
-def search_stream(stream, n_seg, seed, signal=True, statistic=None):
-    # Best track for the first n_seg segments of `stream` (an EMRIInjection with fixed noise),
+def make_search(stream, n_seg, signal=True, statistic=None):
+    # The search of the first n_seg segments of `stream` (an EMRIInjection with fixed noise),
     # plunge at the end of the stream; signal=False searches its noise alone.
     data, stat, t_alpha = make_data_and_statistic(stream, n_seg, signal, statistic)
     model = SVDTrackModel(basis, t_alpha, T_ref=T_REF, force_backend="jax")
     search = EMRISearch(data, stat, model, make_optimizer(), n_initial=N_INITIAL,
                         n_population=N_POPULATION, initial_kwargs={"f0_range": F0_RANGE},
                         spans=H_SPANS if isinstance(stat, ExcessPowerStatistic) else None)
+    return search, data, stat
+
+
+def search_stream(stream, n_seg, seed, signal=True, statistic=None):
+    # Best track for the first n_seg segments of `stream` (see make_search).
+    search, data, stat = make_search(stream, n_seg, signal, statistic)
     return search.run(T_pl=n_seg * T_SFT, seed=seed), data, stat
 """)
 
@@ -898,6 +913,27 @@ print(f"{n_runs} optimisations in total")
 """)
 
 code(r"""
+def comparison_tasks(statistic, sources):
+    # Every optimisation of the comparison as a SearchTask, built lazily (one stream at a time).
+    # Tags: ("inj", i, j, s, k) or ("noise", r, k); seeds as in a serial run.
+    for i, src in enumerate(sources):
+        noise_i = injection.draw_noise(rng=np.random.default_rng(1_000 * COMPARE_SEED + i))   # paired
+        for j, snr in enumerate(COMPARE_SNRS):
+            inj = injector(src, snr, psd, T_data=T_DATA, rng=np.random.default_rng(COMPARE_SEED + i))
+            inj = inj.with_noise(noise=noise_i)
+            for s in range(COMPARE_N_SEEDS):
+                for k, n_seg in enumerate(DURATIONS):
+                    search, _, _ = make_search(inj, n_seg, statistic=statistic)
+                    yield SearchTask(search, n_seg * T_SFT, seed=100 * s + k, tag=("inj", i, j, s, k),
+                                     keep_history=False)
+    for r in range(COMPARE_N_NOISE):
+        noise_r = injection.with_noise(rng=np.random.default_rng(30_000 + r))
+        for k, n_seg in enumerate(DURATIONS):
+            search, _, _ = make_search(noise_r, n_seg, signal=False, statistic=statistic)
+            yield SearchTask(search, n_seg * T_SFT, seed=5_000 + 100 * r + k, tag=("noise", r, k),
+                             keep_history=False)
+
+
 def run_comparison(statistic, sources):
     path = os.path.join(RESULTS_DIR, f"compare_{statistic}.npz")
     if COMPARE_RESUME and os.path.exists(path):
@@ -905,28 +941,23 @@ def run_comparison(statistic, sources):
         return dict(np.load(path))
     shape = (len(sources), len(COMPARE_SNRS), COMPARE_N_SEEDS, len(DURATIONS))
     X, agree = np.zeros(shape), np.zeros(shape)
-    for i, src in enumerate(sources):
-        noise_i = injection.draw_noise(rng=np.random.default_rng(1_000 * COMPARE_SEED + i))   # paired
-        true_f = true_model(src).f
-        for j, snr in enumerate(COMPARE_SNRS):
-            inj = injector(src, snr, psd, T_data=T_DATA, rng=np.random.default_rng(COMPARE_SEED + i))
-            inj = inj.with_noise(noise=noise_i)
-            for s in range(COMPARE_N_SEEDS):
-                for k, n_seg in enumerate(DURATIONS):
-                    res, _, _ = search_stream(inj, n_seg, seed=100 * s + k, statistic=statistic)
-                    X[i, j, s, k] = res.best_statistic
-                    agree[i, j, s, k] = agreement(np.asarray(res.best_track.f), true_f[:n_seg])
-            print(f"{elapsed()} [{statistic}] source {i + 1}/{len(sources)}, SNR {snr:g}: "
-                  f"best per duration {np.round(X[i, j].max(axis=0), 1)}")
     background = np.zeros((COMPARE_N_NOISE, len(DURATIONS)))
-    for r in range(COMPARE_N_NOISE):
-        noise_r = injection.with_noise(rng=np.random.default_rng(30_000 + r))
-        for k, n_seg in enumerate(DURATIONS):
-            res, _, _ = search_stream(noise_r, n_seg, seed=5_000 + 100 * r + k, signal=False, statistic=statistic)
-            background[r, k] = res.best_statistic
-        print(f"{elapsed()} [{statistic}] noise set {r + 1}/{COMPARE_N_NOISE}: max {background[r].max():.1f}")
+    steps = []
+    true_f = [true_model(src).f for src in sources]
+    n_total = int(np.prod(shape)) + background.size
+    for done, (tag, res) in enumerate(run_tasks(comparison_tasks(statistic, sources), n_workers=N_WORKERS), 1):
+        steps.append(res.optimization.history.get("last_step", N_STEPS))
+        if tag[0] == "inj":
+            i, j, s, k = tag[1:]
+            X[i, j, s, k] = res.best_statistic
+            agree[i, j, s, k] = agreement(np.asarray(res.best_track.f), true_f[i][:DURATIONS[k]])
+        else:
+            background[tag[1], tag[2]] = res.best_statistic
+        if done % len(DURATIONS) == 0 or done == n_total:
+            print(f"{elapsed()} [{statistic}] {done}/{n_total} optimisations, "
+                  f"mean iterations {np.mean(steps):.0f} of {N_STEPS}")
     out = dict(X=X, agree=agree, background=background, durations=np.asarray(DURATIONS),
-               snrs=np.asarray(COMPARE_SNRS), sources=np.asarray(sources))
+               snrs=np.asarray(COMPARE_SNRS), sources=np.asarray(sources), iterations=np.asarray(steps))
     np.savez(path, **out)
     return out
 
