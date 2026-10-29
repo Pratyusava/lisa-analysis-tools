@@ -2,8 +2,8 @@
 
 :class:`EMRISearch` composes four swappable parts:
 
-* data       -- :class:`~.data.SFTData`
-* statistic  -- a :class:`~.statistic.SemiCoherentStatistic` (what a track scores)
+* data       -- a data container (:class:`~.data.SFTData`, :class:`~.data.FDData`)
+* statistic  -- a :class:`~.statistic.Statistic` on that data (what a track scores)
 * tracks     -- a track model, ``model(x, shift) -> Track`` over the unit cube
 * optimizer  -- an :class:`~.optimize.Optimizer` (how the cube is explored)
 
@@ -16,9 +16,8 @@ from typing import NamedTuple
 
 import numpy as np
 
-from .data import SFTData
-from .optimize import OptimizationResult, Optimizer, population_map
-from .statistic import SemiCoherentStatistic
+from .optimize import BucketedLoss, OptimizationResult, Optimizer, population_evaluator
+from .statistic import Statistic
 
 
 class SearchResult(NamedTuple):
@@ -34,7 +33,7 @@ class EMRISearch:
     """Maximise ``statistic(data, track_model(x, shift))`` over the unit cube.
 
     Args:
-        data: The SFT data.
+        data: The data container the statistic reads (:meth:`~.statistic.Statistic.prepare`).
         statistic: Detection statistic on the JAX backend (the optimisers
             differentiate and vmap it).
         track_model: Callable ``(x, shift) -> Track`` on the JAX backend, with ``ndim``,
@@ -45,17 +44,24 @@ class EMRISearch:
         n_population: Population the optimiser works on.
         initial_kwargs: Forwarded to ``track_model.initial_population`` (e.g.
             ``f0_range``).
+        spans: Template widths [Hz] to bucket the population by (statistics
+            with ``with_span`` / ``support``, e.g.
+            :class:`~.excess_power.ExcessPowerStatistic`): each member is
+            scored on the narrowest window that holds its template, the rest on
+            the statistic as given. Exact; it only skips empty bins.
+            ``None`` (default): no bucketing.
     """
 
     def __init__(
         self,
-        data: SFTData,
-        statistic: SemiCoherentStatistic,
+        data,
+        statistic: Statistic,
         track_model,
         optimizer: Optimizer,
         n_initial=128,
         n_population=64,
         initial_kwargs=None,
+        spans=None,
     ):
         for name, part in (("statistic", statistic), ("track model", track_model)):
             if not part.backend.name.endswith("jax"):
@@ -70,6 +76,12 @@ class EMRISearch:
         self.n_initial = int(n_initial)
         self.n_population = int(n_population)
         self.initial_kwargs = dict(initial_kwargs or {})
+        self.spans = None if spans is None else tuple(sorted(float(s) for s in spans))
+        if self.spans is not None and not hasattr(statistic, "with_span"):
+            raise ValueError(
+                f"{type(statistic).__name__} has no with_span / support; spans need a "
+                "windowed statistic such as ExcessPowerStatistic."
+            )
         self._check_band()
 
     def _check_band(self):
@@ -95,26 +107,39 @@ class EMRISearch:
                 stacklevel=3,
             )
 
-    def loss_function(self, sfts, shift):
-        """``x -> -statistic`` for one trial plunge (the optimiser's objective)."""
+    def loss_function(self, arr, shift):
+        """``x -> -statistic`` for one trial plunge (the optimiser's objective);
+        ``arr`` is the statistic's data array (:meth:`~.statistic.Statistic.prepare`).
+        A :class:`~.optimize.BucketedLoss` when :attr:`spans` is set."""
         stat, model = self.statistic, self.track_model
 
-        def loss(x):
-            return -stat.evaluate(sfts, model(x, shift))
+        def make_loss(st):
+            def loss(x):
+                return -st.evaluate(arr, model(x, shift))
 
-        return loss
+            return loss
 
-    def run(self, T_pl, seed=0, sfts=None, x0=None) -> SearchResult:
+        if self.spans is None:
+            return make_loss(stat)
+        spans = np.asarray(self.spans)
+
+        def bucket(x):
+            return self.statistic.xp.sum(stat.support(model(x, shift)) > spans)
+
+        losses = tuple(make_loss(stat.with_span(s)) for s in self.spans) + (make_loss(stat),)
+        return BucketedLoss(losses, bucket)
+
+    def run(self, T_pl, seed=0, data=None, x0=None) -> SearchResult:
         """Search one trial plunge time ``T_pl`` [s].
 
-        ``sfts`` overrides the data SFTs (e.g. a noise-only realisation for the
-        background); ``x0`` overrides the initial population.
+        ``data`` overrides the data container (e.g. a noise-only realisation
+        for the background); ``x0`` overrides the initial population.
         """
         import jax
 
         shift = self.track_model.shift_for_plunge(T_pl)
-        sfts = self.statistic.to_backend(self.data.sfts if sfts is None else sfts)
-        loss = self.loss_function(sfts, shift)
+        arr = self.statistic.prepare(self.data if data is None else data)
+        loss = self.loss_function(arr, shift)
 
         if x0 is None:
             x0 = self.track_model.initial_population(
@@ -122,7 +147,7 @@ class EMRISearch:
             )
             x0 = self.statistic.xp.asarray(x0)
             batch_size = getattr(self.optimizer, "batch_size", None)
-            initial_loss = jax.jit(population_map(loss, batch_size))(x0)
+            initial_loss = population_evaluator(loss, batch_size=batch_size)(x0)
             x0 = x0[np.argsort(np.asarray(initial_loss))[: self.n_population]]
 
         result = self.optimizer.run(loss, x0, jax.random.PRNGKey(seed))
@@ -136,6 +161,6 @@ class EMRISearch:
             optimization=result,
         )
 
-    def scan(self, T_pl_grid, seed=0, sfts=None):
+    def scan(self, T_pl_grid, seed=0, data=None):
         """One :meth:`run` per trial plunge time."""
-        return [self.run(T_pl, seed=seed + i, sfts=sfts) for i, T_pl in enumerate(T_pl_grid)]
+        return [self.run(T_pl, seed=seed + i, data=data) for i, T_pl in enumerate(T_pl_grid)]

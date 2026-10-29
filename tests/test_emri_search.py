@@ -31,7 +31,10 @@ from lisatools.search.emri import (
     DifferentialEvolution,
     EMRIInjection,
     EMRISearch,
+    ExcessPowerStatistic,
+    FDData,
     FresnelStatistic,
+    MatchedFilterStatistic,
     SensitivityPSD,
     SFTData,
     SVDBasis,
@@ -42,7 +45,7 @@ from lisatools.search.emri import (
     gaussian_noise,
     tukey_chirp_kernel,
 )
-from lisatools.search.emri.optimize import de_settings
+from lisatools.search.emri.optimize import BucketedLoss, de_settings, population_evaluator
 from lisatools.utils.constants import YRSID_SI
 
 T_SFT = 5e4
@@ -870,6 +873,250 @@ class SearchTest(unittest.TestCase):
         clone = pickle.loads(pickle.dumps(copy.deepcopy(search)))
         self.assertEqual(clone.statistic.P, search.statistic.P)
         np.testing.assert_array_equal(clone.track_model.basis.V, self.basis.V)
+
+
+class ExcessPowerTest(unittest.TestCase):
+    """FDData and the delay-scanning statistics (matched filter, Cutler &
+    Bustamante-Rosell's H) on linear chirps in the analytic PSD."""
+
+    BAND = dict(min_freq=1e-3, max_freq=1e-2)
+
+    def setUp(self):
+        self.psd = toy_psd()
+        self.n = int(N_SEG * T_SFT / DT)
+        self.t_alpha = np.arange(N_SEG) * T_SFT
+
+    def chirp(self, fdot, snr=30.0):
+        """A unit-SNR-scaled linear chirp at 3 mHz and its track."""
+        from lisatools.search.emri import band_snr
+
+        t = np.arange(self.n) * DT
+        h = np.cos(2 * np.pi * (3e-3 * t + 0.5 * fdot * t**2))
+        h *= snr / band_snr(h, DT, self.psd, (1e-3, 1e-2))
+        return h, Track(3e-3 + fdot * self.t_alpha, np.full(N_SEG, fdot))
+
+    def fd(self, x, **kwargs):
+        return FDData.from_timeseries(x, DT, self.psd, **self.BAND, **kwargs)
+
+    def test_fd_data_matches_rfft(self):
+        x = np.random.default_rng(3).normal(size=self.n + 17)
+        d = self.fd(x, duration=10 * T_SFT, window_alpha=0.0)
+        n = int(10 * T_SFT / DT)
+        ref = DT * np.fft.rfft(x[:n])
+        self.assertAlmostEqual(d.T, 10 * T_SFT)
+        np.testing.assert_allclose(d.fd[0], ref[d.first_bin : d.first_bin + d.n_bins], rtol=1e-12)
+        np.testing.assert_allclose(d.freqs, (d.first_bin + np.arange(d.n_bins)) / d.T)
+        with self.assertRaisesRegex(ValueError, "duration"):
+            self.fd(x, duration=2 * self.n * DT)
+
+    def test_taper_removes_cut_transient(self):
+        """A stream cut from a longer one: untapered, the step at the FFT's wrap
+        is a whitened red-noise transient that H picks up (seed with a large
+        step); the default taper removes it and keeps the noise mean at 2."""
+        n, t = self.n, self.t_alpha
+        fdot = (1e-3 - 3.2e-4) / t[-1]
+        track = Track(3.2e-4 + fdot * t, np.full(N_SEG, fdot))
+        x = gaussian_noise(4 * n, DT, self.psd, rng=1)
+        H = {}
+        for alpha in (0.0, 0.01):
+            d = FDData.from_timeseries(
+                x, DT, self.psd, min_freq=3e-4, max_freq=1e-2, duration=n * DT, window_alpha=alpha
+            )
+            stat = ExcessPowerStatistic.for_data(d, t, force_backend="cpu")
+            H[alpha] = float(stat.evaluate(stat.prepare(d), track))
+        self.assertGreater(H[0.0], 30.0)
+        self.assertLess(H[0.01], 10.0)
+        power = 4 * d.df * np.abs(d.fd[0]) ** 2 / self.psd(d.freqs)
+        self.assertAlmostEqual(power.mean(), 2.0, delta=0.05)
+
+    def test_injection_fd_stream(self):
+        signal = chirp_timeseries(chirp_track(), 1e-20)[None]
+        inj = EMRIInjection(signal, DT, {}, 30.0, "A", self.psd).with_noise(rng=4)
+        d = inj.fd_data(duration=12 * T_SFT, **self.BAND)
+        ref = self.fd(inj.signal + inj.noise, duration=12 * T_SFT)
+        np.testing.assert_array_equal(d.fd, ref.fd)
+
+    def test_matched_filter_recovers_snr(self):
+        h, track = self.chirp(2e-10)
+        d = self.fd(h)
+        mf = MatchedFilterStatistic.for_data(d, self.t_alpha, force_backend="cpu")
+        rho = float(mf.evaluate(mf.prepare(d), track))
+        self.assertGreater(rho, 0.98 * 30)  # SPA edge loss ~1% at 288 bins
+        self.assertLessEqual(rho, 30 * (1 + 1e-6))
+
+    def test_noise_calibration(self):
+        """Mean |rho|^2 = 2 and unit-variance window sums with the exact Q(N)
+        (288-bin template); the asymptotic Q over-normalises a 29-bin one."""
+        _, wide = self.chirp(2e-10)
+        _, narrow = self.chirp(2e-11)
+        d0 = self.fd(np.zeros(self.n))
+        exact = ExcessPowerStatistic.for_data(d0, self.t_alpha, force_backend="cpu")
+        asym = ExcessPowerStatistic.for_data(
+            d0, self.t_alpha, normalization="asymptotic", force_backend="cpu"
+        )
+        q_exact = exact.window_q(exact.template(wide)[0])
+        q_asym = asym.window_q(asym.template(narrow)[0])
+        rng = np.random.default_rng(0)
+        means, wide_sums, narrow_sums = [], [], []
+        for _ in range(200):
+            arr = exact.prepare(self.fd(gaussian_noise(self.n, DT, self.psd, rng=rng)))
+            power, _ = exact.correlation_power(arr, wide)
+            means.append(power.mean())
+            wide_sums.append([(power[:n] - 2).sum() / np.sqrt(4 * n) for n in exact.cells])
+            power, _ = exact.correlation_power(arr, narrow)
+            narrow_sums.append((power[: exact.cells[0]] - 2).sum() / np.sqrt(4 * exact.cells[0]))
+        wide_sums = np.array(wide_sums)
+        # Each draw's delay average has std ~2 / sqrt(288 bins): 3 sigma over 200 draws.
+        self.assertAlmostEqual(np.mean(means), 2.0, delta=0.03)
+        for k in range(len(exact.cells)):
+            std = np.std(wide_sums[:, k] / np.sqrt(q_exact[k]))
+            self.assertAlmostEqual(std, 1.0, delta=0.15, msg=exact.cells[k])
+        self.assertLess(np.std(np.array(narrow_sums) / np.sqrt(q_asym[0])), 0.5)
+
+    def test_h_prefers_the_signal_track(self):
+        h, track = self.chirp(2e-11)
+        d = self.fd(h + gaussian_noise(self.n, DT, self.psd, rng=1)[0])
+        H = ExcessPowerStatistic.for_data(d, self.t_alpha, force_backend="cpu")
+        arr = H.prepare(d)
+        on = float(H.evaluate(arr, track))
+        off = float(H.evaluate(arr, Track(track.f + 2e-3, track.fdot)))
+        crossing = float(H.evaluate(arr, Track(track.f[::-1], track.fdot)))  # crosses once
+        print(f"[H] on track {on:.1f}, 2 mHz off {off:.1f}, crossing {crossing:.1f}")
+        self.assertGreater(on, 50.0)
+        self.assertLess(off, 6.0)
+        self.assertGreater(crossing, 4 * off)
+        self.assertEqual(float(H.evaluate(arr, Track(np.zeros(N_SEG), np.zeros(N_SEG)))), 0.0)
+
+    def test_jax_matches_numpy(self):
+        h, track = self.chirp(2e-11)
+        d = self.fd(h + gaussian_noise(self.n, DT, self.psd, rng=2)[0])
+        tj = Track(jnp.asarray(track.f), jnp.asarray(track.fdot))
+        for cls in (MatchedFilterStatistic, ExcessPowerStatistic):
+            s_np = cls.for_data(d, self.t_alpha, force_backend="cpu")
+            s_jx = cls.for_data(d, self.t_alpha, force_backend="jax")
+            ref = float(s_np.evaluate(s_np.prepare(d), track))
+            got = float(s_jx.evaluate(s_jx.prepare(d), tj))
+            self.assertAlmostEqual(got / ref, 1.0, places=12, msg=cls.__name__)
+            grad = jax.grad(lambda f: s_jx.evaluate(s_jx.prepare(d), Track(f, tj.fdot)))(tj.f)
+            self.assertTrue(bool(jnp.all(jnp.isfinite(grad))), cls.__name__)
+
+    def test_search_with_h(self):
+        h, track = self.chirp(2.5e-11, snr=40.0)
+        d = self.fd(h + gaussian_noise(self.n, DT, self.psd, rng=5)[0])
+        stat = ExcessPowerStatistic.for_data(d, self.t_alpha, force_backend="jax")
+        model = SVDTrackModel(toy_basis(), self.t_alpha, T_ref=N_SEG * T_SFT, force_backend="jax")
+        search = EMRISearch(
+            d,
+            stat,
+            model,
+            AdamDE(n_steps=20, save_every=5),
+            n_initial=64,
+            n_population=16,
+            initial_kwargs={"f0_range": (2e-3, 4e-3)},
+        )
+        res = search.run(T_pl=N_SEG * T_SFT, seed=0)
+        noise = search.run(
+            T_pl=N_SEG * T_SFT, seed=0, data=self.fd(gaussian_noise(self.n, DT, self.psd, rng=6))
+        )
+        print(f"[H search] signal {res.best_statistic:.1f}, noise only {noise.best_statistic:.1f}")
+        self.assertGreater(res.best_statistic, 3 * noise.best_statistic)
+
+    def test_span_buckets_are_exact(self):
+        """A track scored on a window holding its template gives the whole-band
+        H and gradient; a bucketed loss gives the plain loss on a population."""
+        h, track = self.chirp(2e-11)
+        d = self.fd(h + gaussian_noise(self.n, DT, self.psd, rng=2)[0])
+        full = ExcessPowerStatistic.for_data(d, self.t_alpha, force_backend="cpu")
+        width = float(full.support(track))
+        narrow = full.with_span(1.1 * width)
+        self.assertLess(narrow.n_window, full.n_bins)
+        arr = full.prepare(d)
+        ref = float(full.evaluate(arr, track))
+        self.assertAlmostEqual(float(narrow.evaluate(arr, track)) / ref, 1.0, places=10)
+
+        stat = ExcessPowerStatistic.for_data(d, self.t_alpha, force_backend="jax")
+        model = SVDTrackModel(toy_basis(), self.t_alpha, T_ref=N_SEG * T_SFT, force_backend="jax")
+        kw = dict(initial_kwargs={"f0_range": (2e-3, 4e-3)})
+        plain = EMRISearch(d, stat, model, AdamDE(n_steps=1), **kw)
+        spans = (1e-5, 3e-5)
+        bucketed = EMRISearch(d, stat, model, AdamDE(n_steps=1), spans=spans, **kw)
+        shift = model.shift_for_plunge(N_SEG * T_SFT)
+        arr = stat.prepare(d)
+        loss_b = bucketed.loss_function(arr, shift)
+        self.assertIsInstance(loss_b, BucketedLoss)
+        x = jnp.asarray(model.initial_population(40, seed=0, f0_range=(2e-3, 4e-3)))
+        buckets = np.asarray(jax.vmap(loss_b.bucket)(x))
+        self.assertGreater(len(set(buckets.tolist())), 1)
+        for transform in (None, jax.value_and_grad):
+            want = population_evaluator(plain.loss_function(arr, shift), transform)(x)
+            got = population_evaluator(loss_b, transform, batch_size=8)(x)
+            for w, g in zip(jax.tree_util.tree_leaves(want), jax.tree_util.tree_leaves(got)):
+                np.testing.assert_allclose(np.asarray(g), np.asarray(w), rtol=1e-8, atol=1e-10)
+        with self.assertRaisesRegex(ValueError, "with_span"):
+            sft = SFTData.from_timeseries(np.zeros((1, self.n)), DT, T_SFT, self.psd)
+            EMRISearch(
+                sft,
+                FresnelStatistic.for_data(sft, force_backend="jax"),
+                model,
+                AdamDE(n_steps=1),
+                spans=spans,
+            )
+
+    def test_bad_options_raise(self):
+        d = self.fd(np.zeros(self.n))
+        with self.assertRaisesRegex(ValueError, "amplitude"):
+            MatchedFilterStatistic.for_data(d, self.t_alpha, amplitude="x", force_backend="cpu")
+        with self.assertRaisesRegex(ValueError, "normalization"):
+            ExcessPowerStatistic.for_data(d, self.t_alpha, normalization="x", force_backend="cpu")
+        with self.assertRaisesRegex(ValueError, "uniformly"):
+            ExcessPowerStatistic.for_data(d, self.t_alpha**1.01, force_backend="cpu")
+
+    def test_folded_delay_transform(self):
+        """More bins than delays: the folded M-point transform is the direct
+        sum over every bin at tau_j = j T / M (and plain zero-padding when
+        there are fewer bins)."""
+        d = self.fd(np.zeros(self.n))
+        rng = np.random.default_rng(6)
+        for step in (200.0, 20.0):
+            stat = ExcessPowerStatistic.for_data(
+                d, self.t_alpha, delay_step=step, force_backend="cpu"
+            )
+            x = rng.normal(size=(2, d.n_bins)) + 1j * rng.normal(size=(2, d.n_bins))
+            j = rng.integers(0, stat.n_fft, 7)
+            k = np.arange(d.n_bins)
+            direct = x @ np.exp(2j * np.pi * np.outer(k, j) / stat.n_fft)
+            np.testing.assert_allclose(stat.delay_transform(x)[:, j], direct, rtol=1e-9)
+        self.assertGreater(d.n_bins, ExcessPowerStatistic.for_data(d, self.t_alpha).n_fft)
+
+    def test_template_matches_interp(self):
+        """The arithmetic bracketing of the bins equals np.interp's t(f) and
+        fdot(t(f)), on a track that also turns down (cummax plateau)."""
+        d = self.fd(np.zeros(self.n))
+        stat = ExcessPowerStatistic.for_data(d, self.t_alpha, force_backend="cpu")
+        t = self.t_alpha
+        f = 3e-3 + 2e-10 * t + 1.5e-3 * np.sin(t / t[-1] * 5.0)
+        track = Track(f, np.gradient(f, t))
+        A, psi, valid, _ = stat.template(track)
+        self.assertTrue(valid)
+        dt = t[1] - t[0]
+        keep = stat.mask(track, dt, np) > 0
+        fk, fdk = np.where(keep, track.f, 0.0), np.where(keep, track.fdot, 0.0)
+        t1 = np.append(t, t[-1] + dt)
+        f_up = np.maximum.accumulate(np.append(fk, fk[-1] + fdk[-1] * dt))
+        t_k = np.interp(d.freqs, f_up, t1)
+        fdot_k = np.interp(t_k, t1, np.append(fdk, fdk[-1]))
+        inside = (d.freqs >= np.min(np.where(keep, f, np.inf))) & (d.freqs <= f_up[-1])
+        a = np.where(inside, 1 / np.sqrt(np.maximum(fdot_k, stat.fdot_floor)), 0.0)
+        a /= np.sqrt(4 * d.df * np.sum(a**2 / stat.psd_bins))
+        np.testing.assert_allclose(A, a, rtol=1e-10, atol=1e-12 * a.max())
+        np.testing.assert_allclose(psi, 2 * np.pi * d.df * (np.cumsum(t_k) - 0.5 * t_k), rtol=1e-12)
+
+    def test_config_pickles(self):
+        d = self.fd(np.zeros(self.n))
+        stat = ExcessPowerStatistic.for_data(d, self.t_alpha, force_backend="cpu")
+        clone = pickle.loads(pickle.dumps(copy.deepcopy(stat)))
+        self.assertEqual(clone.cells, stat.cells)
+        self.assertEqual(clone.n_fft, stat.n_fft)
 
 
 class InjectionTest(unittest.TestCase):

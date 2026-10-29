@@ -26,10 +26,11 @@ with the modular re-implementation in `lisatools.search.emri`.
 
 1. **Inject** a FEW Kerr eccentric equatorial EMRI through LISA's TDI response, scaled to a target SNR, into Gaussian noise.
 2. **Segment** the data into short Fourier transforms (SFTs).
-3. **Score** a frequency track with the semi-coherent linear-chirp (Fresnel) statistic.
+3. **Score** a frequency track with the semi-coherent linear-chirp (Fresnel) statistic, or with Cutler & Bustamante-Rosell's coherent excess-power statistic $H$ (Sec. 4b, `STATISTIC`).
 4. **Parametrise** tracks by an SVD basis of FEW tracks, shifted in time to a trial plunge.
 5. **Optimise** the basis coefficients with Lorenzo's Adam + differential-evolution hybrid, once per data duration.
 6. **Background**: repeat on noise-only data, normalise the statistic per duration, fit a Gumbel distribution to the noise maxima, set false-alarm thresholds, and decide detection.
+7. **Compare** statistics on the same injections: localisation and detection versus SNR (Sec. 10).
 
 **Settings.** The cell under each *Inputs* heading runs the **toy problem** (minutes on a laptop).
 The paper's and Lorenzo's repository settings sit next to every input, commented out (`# PAPER:` / `# REPO:`).
@@ -68,9 +69,11 @@ from lisatools.search.emri import (
     Adam,
     AdamDE,
     EMRISearch,
+    ExcessPowerStatistic,
     FEWHarmonicTrackModel,
     FEWInjector,
     FresnelStatistic,
+    MatchedFilterStatistic,
     SegmentMask,
     SensitivityPSD,
     SVDBasis,
@@ -214,11 +217,25 @@ md(r"""
 |---|---|---|
 | `P` | $P$ | Half-width of the bin window around the track ($2P+1$ bins per segment) |
 | `MASK` | $f_{\min}, \dot f_{\min}, \delta\phi_{\max}$ | Segments counted: $f > f_{\min}$, $\dot f > \dot f_{\min}$, $\lvert\ddot f\rvert T_{\rm SFT}^3/6 < \delta\phi_{\max}$ |
+| `STATISTIC` | | What the search maximises: `"fresnel"` (Lorenzo's $\mathcal S$, Sec. 4) or `"H"` (Cutler & Bustamante-Rosell, Sec. 4b) |
+| `H_BAND` | | Frequency band of the coherent FFT $\tilde d(f)$ that $H$ reads [Hz]; must contain the tracks |
+| `H_WINDOWS` | $W$ | Delay-window lengths $N\,\delta\tau$ that $H$ maximises over [s] |
+| `H_DELAY_STEP` | $\delta\tau$ | Target spacing of the delay grid [s] |
+| `H_NORMALIZATION` | $Q(N)$ | `"exact"`: finite-window variance per template; `"asymptotic"`: the draft's large-window $R = L/K$ |
+| `H_WINDOW_ALPHA` | | Tukey taper of the stream before its FFT. Each search duration cuts the stream, and the FFT wraps the cut end onto the start: untapered, that step in the steep low-frequency noise whitens into a loud transient at delay 0, which $H$ sums into values in the thousands on pure noise |
+| `H_SPANS` | | Template widths [Hz] the population is sorted by: each member is scored on the narrowest window of bins that holds its template instead of on all of `H_BAND`. Exact (it only skips bins where the template is zero) and ~1.5$\times$ faster on the toy; `None` scores every member on the whole band |
 """)
 
 code(r"""
 P = 100                                                   # PAPER / REPO: 100
 MASK = SegmentMask(f_min=10**-3.5, fdot_min=1e-13, dphi_max=1.0)   # PAPER / REPO
+STATISTIC = "fresnel"                                     # PAPER / REPO;  "H": Cutler & Bustamante-Rosell
+H_BAND = (3e-4, 2e-2)
+H_WINDOWS = (2e3, 4.2e3, 1.72e4, 6.9e4)                   # CB-R draft: {10, 21, 86, 345} cells of ~200 s
+H_DELAY_STEP = 200.0                                      # CB-R draft: ~200 s
+H_NORMALIZATION = "exact"                                 # CB-R draft: "asymptotic"
+H_WINDOW_ALPHA = 0.01                                     # 0 = rectangular (do not: see the table)
+H_SPANS = (2.5e-3, 5e-3, 1e-2)                            # None = whole band (same result, slower)
 """)
 
 md(r"""
@@ -273,6 +290,38 @@ P_FA = (0.5, 1e-2, 1e-4)           # PAPER
 PAPER_GUMBEL = (1.94, 0.56)        # PAPER Sec. III.1
 """)
 
+md(r"""
+### 1h. Statistic comparison (Sec. 10)
+
+A paired comparison of the statistics: every statistic searches the **same** injections (same sources, noise draws and
+optimiser seeds, same budget), and its detections are thresholded on its **own** noise background.
+
+| Name | Meaning |
+|---|---|
+| `COMPARE_STATISTICS` | Statistics compared (`"fresnel"`, `"H"`) |
+| `COMPARE_SNRS` | Injected SNRs (over `T_SNR`); each source is injected at every SNR with the same noise |
+| `COMPARE_N_SOURCES` | Sources drawn from the Table 1 priors (`BANK_PRIOR`), each plunging at the end of a random duration of the grid |
+| `COMPARE_N_SEEDS` | Optimiser seeds per injection (restarts; also reported as best-of-seeds) |
+| `COMPARE_N_NOISE` | Noise-only data sets searched per statistic for its background |
+| `COMPARE_SEED` | Seed of the source draws, angles and noise |
+| `LOC_TOL_BINS`, `LOC_FRACTION` | A run is *localised* when its best track is within `LOC_TOL_BINS` / $T_{\rm SFT}$ of the true m=2 track on at least `LOC_FRACTION` of the in-band segments |
+| `COMPARE_P_FA` | False-alarm probability of the detection threshold |
+| `COMPARE_RESUME` | Reuse `compare_<statistic>.npz` in `RESULTS_DIR` when present (restart a long run where it stopped) |
+""")
+
+code(r"""
+COMPARE_STATISTICS = ("fresnel", "H")
+COMPARE_SNRS = (20.0, 30.0)        # PAPER: (20, 25, 30, 35, 40);  CB-R draft: (10, 12, 15, 17, 20)
+COMPARE_N_SOURCES = 3              # PAPER: 100 per SNR;  CB-R draft: 16
+COMPARE_N_SEEDS = 2                # CB-R draft: 3 paired optimiser seeds
+COMPARE_N_NOISE = 4                # PAPER: 100;  CB-R draft: 240
+COMPARE_SEED = 7
+LOC_TOL_BINS = 2.0
+LOC_FRACTION = 0.9
+COMPARE_P_FA = 1e-2                # CB-R draft: empirical 1% per search
+COMPARE_RESUME = True
+""")
+
 # --------------------------------------------------------------------------- injection
 md(r"""
 ## 2. Injection
@@ -303,6 +352,49 @@ injection = injector(SOURCE, SNR, psd, T_data=T_DATA, rng=np.random.default_rng(
 injection = injection.with_noise(rng=np.random.default_rng(NOISE_SEED))   # d = h + n, n fixed from here on
 print(elapsed(), "injection:", {k: round(v, 4) if isinstance(v, float) else v for k, v in injection.params.items()})
 print(f"SNR of the analysed {T_DATA} yr: {band_snr(injection.signal, DT, psd):.2f}  (target {SNR} over {T_SNR} yr)")
+""")
+
+md(r"""
+**The injected waveform.** Top: the A-channel signal $h_A(t)$ over the analysed stream (the noise is far larger
+sample by sample, so it is not drawn), and one hour at the start and one hour before plunge, where the frequency and amplitude have grown.
+Bottom: the signal's characteristic strain $h_c = 2f\,\lvert\tilde h(f)\rvert$ against the noise amplitude
+$h_n = \sqrt{f\,S_n(f)}$. Their ratio integrates to the SNR,
+$$\rho^2 = \int \Big(\frac{h_c}{h_n}\Big)^2 d\ln f = 4\int \frac{\lvert\tilde h\rvert^2}{S_n}\,df ,$$
+so the height of the signal above the noise curve, over the band it spans, is what the search accumulates.
+The steps are the harmonics $m\,\Phi_\phi$ ($m = 1, 2, 3, \dots$) sweeping their bands; the search follows $m = 2$.
+""")
+
+code(r"""
+h_A = injection.signal[0]
+t_days = injection.times / 86400
+t_plunge = T_PL * YRSID_SI / 86400
+fd_sig = injection.fd_data(noise=False, min_freq=1e-4, max_freq=5e-2)
+
+fig = plt.figure(figsize=(13, 7))
+gs = fig.add_gridspec(2, 3)
+ax = fig.add_subplot(gs[0, 0])
+step = max(1, h_A.size // 200_000)
+ax.plot(t_days[::step], h_A[::step], lw=0.3)
+ax.axvline(t_plunge, color="k", ls=":", lw=0.8, label="plunge")
+ax.set_xlabel("t [d]"); ax.set_ylabel(r"$h_A(t)$"); ax.set_title("A channel, analysed stream", pad=14); ax.legend()
+in_band = np.flatnonzero(np.abs(h_A) > 0)
+hour = 1 / 24
+for col, (t0, title) in enumerate(((t_days[in_band[0]], "first hour"),
+                                   (min(t_plunge, t_days[in_band[-1]]) - hour, "last hour before plunge")), start=1):
+    ax = fig.add_subplot(gs[0, col])
+    sel = (t_days >= t0) & (t_days < t0 + hour)
+    ax.plot((t_days[sel] - t0) * 1440, h_A[sel], lw=0.8)
+    ax.set_xlabel(f"t - {t0:.2f} d [min]"); ax.set_title(title, pad=14)
+ax = fig.add_subplot(gs[1, :])
+f = fd_sig.freqs
+h_c, h_n = 2 * f * np.abs(fd_sig.fd[0]), np.sqrt(f * psd(f))
+ax.loglog(f, h_n, "k", lw=1.2, label=r"noise $h_n = \sqrt{f S_n(f)}$")
+ax.loglog(f, h_c, "C1", lw=0.6, label=r"signal $h_c = 2f|\tilde h(f)|$")
+ax.set_xlim(1e-4, 5e-2); ax.set_ylim(h_n.min() / 10, None)
+ax.set_xlabel("f [Hz]"); ax.set_ylabel("characteristic strain"); ax.legend(loc="lower left")
+snr_check = np.sqrt(4 * np.sum(np.abs(fd_sig.fd[0]) ** 2 / psd(f)) * fd_sig.df)
+ax.set_title(f"spectrum of the analysed stream (SNR from the curves: {snr_check:.1f})")
+plt.tight_layout()
 """)
 
 # --------------------------------------------------------------------------- SFTs
@@ -386,6 +478,87 @@ true_track = FEWHarmonicTrackModel(full.t_alpha, m=2, n=0)(SOURCE)
 noise_mean = 1.75 * MASK(true_track, T_SFT, np).sum()
 print(f"noise-only expectation on the m=2 track: ~{noise_mean:.0f}")
 print(f"true track starts at f = {true_track.f[0]:.3e} Hz; F0_RANGE = {F0_RANGE}")
+""")
+
+# --------------------------------------------------------------------------- H statistic
+md(r"""
+## 4b. Alternative statistic: Cutler & Bustamante-Rosell's $H$
+
+Instead of cutting the data into segments, $H$ correlates **one full-length template** $h$ with the whole stream at every
+time delay $\tau_j = j\,\delta\tau$ (one inverse FFT):
+
+$$
+\rho_j = \langle d \mid h_{\tau_j}\rangle = 4\,\Delta f \sum_k \frac{\tilde d_k^*\, \tilde h_k\, e^{-2\pi i f_k \tau_j}}{S_n(f_k)},
+\qquad \langle h\mid h\rangle = 1, \qquad \mathbb E_{\rm noise}\lvert\rho_j\rvert^2 = 2 .
+$$
+
+A template far from the signal overlaps it only where their f–t tracks **cross**, coherently for
+$t_{\rm coh} \approx \lvert\Delta\dot f\rvert^{-1/2}$; time-slides of the template still cross, so the overlap spreads over
+many consecutive delays. $H$ collects that excess power over a window of $N$ delays, normalised to unit noise variance, and maximises
+over the window's start $i$ and length $N \in W$ (draft Eqs. 4, A4–A5):
+
+$$
+H = \max_{N \in W}\, \max_i \frac{\sum_{j=i}^{i+N-1}\big(\lvert\rho_j\rvert^2 - 2\big)}{\sqrt{4 N\, Q(N)}},
+\qquad
+Q(N) = \sum_{\lvert m\rvert < N}\Big(1 - \frac{\lvert m\rvert}{N}\Big)\lvert\langle h_0 \mid h_m\rangle\rvert^2 .
+$$
+
+$Q(N)$ corrects for the correlation of neighbouring delays (`"exact"`, per template). The draft uses its large-window limit
+$R = L/K$, which only holds when the template spans a wide band (`"asymptotic"`). The matched filter
+$M = \max_j \lvert\rho_j\rvert$ is the coherent comparator.
+
+**Templates from our tracks.** The track model is unchanged (Sec. 5–6); the template follows by stationary phase:
+$t(f)$ by inverting the track, $\Psi(f) = 2\pi\!\int t\,df$, amplitude $\lvert\tilde h\rvert \propto \dot f^{-1/2}$
+(constant-amplitude chirp), with $\tilde h = \lvert\tilde h\rvert e^{-i\Psi}$. LISA's response is not in the template.
+
+**Below:** how $\mathcal S$, $M$ and $H$ respond as a template is rotated away from the true track about the middle of the
+stream, $f(t) \to f(t) + \epsilon\,(t - t_c)$: every such template still **crosses** the truth at $t_c$.
+Each response is $(\text{value} - \mu_0)/\sigma_0$, with $\mu_0, \sigma_0$ from noise-only draws at the true template (draft Fig. 4).
+""")
+
+code(r"""
+fd_full = injection.fd_data(min_freq=H_BAND[0], max_freq=H_BAND[1], window_alpha=H_WINDOW_ALPHA)
+t_segments = full.t_alpha
+H_stat = ExcessPowerStatistic.for_data(fd_full, t_segments, windows=H_WINDOWS, delay_step=H_DELAY_STEP,
+                                       normalization=H_NORMALIZATION, force_backend="cpu")
+M_stat = MatchedFilterStatistic.for_data(fd_full, t_segments, delay_step=H_DELAY_STEP, force_backend="cpu")
+print(f"FFT band {H_BAND} Hz: {fd_full.n_bins} bins; delay step {H_stat.delay_step:.0f} s; windows {H_stat.cells} cells")
+
+t_c = 0.5 * N_SEG_TOTAL * T_SFT
+EPS = np.array([0.0, 1e-13, 3e-13, 1e-12, 3e-12, 1e-11, 3e-11])   # fdot offsets [Hz/s]
+
+
+def rotated(eps):
+    return Track(true_track.f + eps * (t_segments - t_c), true_track.fdot + eps, true_track.fddot)
+
+
+def all_statistics(sfts_arr, fd_arr, track):
+    return (float(stat_full.evaluate(sfts_arr, track)), float(M_stat.evaluate(fd_arr, track)),
+            float(H_stat.evaluate(fd_arr, track)))
+
+
+N_CAL = 20
+cal = []
+for r in range(N_CAL):
+    noise_r = injection.with_noise(rng=np.random.default_rng(20_000 + r))
+    cal.append(all_statistics(stat_full.prepare(noise_r.sft_data(T_SFT, signal=False, window_alpha=WINDOW_ALPHA)),
+                              H_stat.prepare(noise_r.fd_data(signal=False, min_freq=H_BAND[0], max_freq=H_BAND[1],
+                                                                window_alpha=H_WINDOW_ALPHA)),
+                              true_track))
+mu0, sigma0 = np.mean(cal, axis=0), np.std(cal, axis=0, ddof=1)
+sfts_arr, fd_arr = stat_full.prepare(full), H_stat.prepare(fd_full)
+response = np.array([(np.array(all_statistics(sfts_arr, fd_arr, rotated(e))) - mu0) / sigma0 for e in EPS])
+for e, (zs, zm, zh) in zip(EPS, response):
+    print(f"eps = {e:7.1e} Hz/s:  S {zs:8.1f}   M {zm:8.1f}   H {zh:8.1f}   (noise sigma units)")
+print(elapsed(), "response computed")
+
+plt.figure(figsize=(6, 3.6))
+x = np.where(EPS > 0, EPS, EPS[1] / 3)
+for k, name in enumerate((r"$\mathcal{S}$ (Fresnel)", r"$M = \max|\rho|$", r"$H$")):
+    plt.loglog(x, np.clip(response[:, k], 0.1, None), "o-", label=name)
+plt.axhline(3, color="grey", ls=":", lw=0.8)
+plt.xlabel(r"$\epsilon$ [Hz/s] (leftmost: true track)"); plt.ylabel("(value - noise mean) / noise std")
+plt.legend(); plt.tight_layout()
 """)
 
 # --------------------------------------------------------------------------- basis
@@ -518,14 +691,30 @@ def make_optimizer():
     )
 
 
-def search_stream(stream, n_seg, seed, signal=True):
+def make_data_and_statistic(stream, n_seg, signal=True, statistic=None, force_backend="jax"):
+    # The data the statistic (default: STATISTIC) reads, for the first n_seg segments, and the statistic on it.
+    t_alpha = np.arange(n_seg) * T_SFT
+    statistic = STATISTIC if statistic is None else statistic
+    if statistic not in ("fresnel", "H"):
+        raise ValueError(f"unknown statistic {statistic!r}")
+    if statistic == "fresnel":
+        data = stream.sft_data(T_SFT, signal=signal, n_segments=n_seg, window_alpha=WINDOW_ALPHA)
+        return data, FresnelStatistic.for_data(data, P=P, mask=MASK, force_backend=force_backend), t_alpha
+    data = stream.fd_data(signal=signal, duration=n_seg * T_SFT, min_freq=H_BAND[0], max_freq=H_BAND[1],
+                          window_alpha=H_WINDOW_ALPHA)
+    stat = ExcessPowerStatistic.for_data(data, t_alpha, windows=H_WINDOWS, delay_step=H_DELAY_STEP,
+                                         normalization=H_NORMALIZATION, force_backend=force_backend)
+    return data, stat, t_alpha
+
+
+def search_stream(stream, n_seg, seed, signal=True, statistic=None):
     # Best track for the first n_seg segments of `stream` (an EMRIInjection with fixed noise),
     # plunge at the end of the stream; signal=False searches its noise alone.
-    data = stream.sft_data(T_SFT, signal=signal, n_segments=n_seg, window_alpha=WINDOW_ALPHA)
-    stat = FresnelStatistic.for_data(data, P=P, mask=MASK, force_backend="jax")
-    model = SVDTrackModel(basis, data.t_alpha, T_ref=T_REF, force_backend="jax")
+    data, stat, t_alpha = make_data_and_statistic(stream, n_seg, signal, statistic)
+    model = SVDTrackModel(basis, t_alpha, T_ref=T_REF, force_backend="jax")
     search = EMRISearch(data, stat, model, make_optimizer(), n_initial=N_INITIAL,
-                        n_population=N_POPULATION, initial_kwargs={"f0_range": F0_RANGE})
+                        n_population=N_POPULATION, initial_kwargs={"f0_range": F0_RANGE},
+                        spans=H_SPANS if isinstance(stat, ExcessPowerStatistic) else None)
     return search.run(T_pl=n_seg * T_SFT, seed=seed), data, stat
 """)
 
@@ -542,7 +731,7 @@ injection_results = {}
 for k, n_seg in enumerate(DURATIONS):
     res, data_k, stat_k = search_stream(injection, n_seg, seed=SEARCH_SEED + k)
     tt = Track(true_track.f[:n_seg], true_track.fdot[:n_seg], true_track.fddot[:n_seg])
-    s_true = float(stat_k.evaluate(stat_k.to_backend(data_k.sfts), tt))
+    s_true = float(stat_k.evaluate(stat_k.prepare(data_k), tt))
     injection_results[n_seg] = dict(result=res, true_statistic=s_true)
     print(f"{elapsed()} n = {n_seg:4d} segments: best S = {res.best_statistic:8.1f}   true track S = {s_true:8.1f}")
 np.savez(os.path.join(RESULTS_DIR, "injection.npz"),
@@ -645,8 +834,139 @@ plt.tight_layout()
 print(elapsed(), "done")
 """)
 
+# --------------------------------------------------------------------------- comparison
 md(r"""
-## 10. Producing the paper's results
+## 10. Which statistic is better? A paired comparison
+
+Each statistic in `COMPARE_STATISTICS` runs the full search (Secs. 6–8: every duration, plunge at the end of the stream) on
+the same injections and noise, with the same optimiser and seeds; only the objective changes (as in the CB-R draft, Sec. V).
+Two questions, per SNR:
+
+* **Localisation.** At the duration $k^\star$ where the normalised statistic peaks, does the best track follow the true
+  m=2 track? The agreement is the fraction of in-band segments with
+  $\lvert f^{\rm best}_\alpha - f^{\rm true}_\alpha\rvert < $ `LOC_TOL_BINS`$/T_{\rm SFT}$; the run is localised when it
+  reaches `LOC_FRACTION`.
+* **Detection.** With each statistic's own noise background (`COMPARE_N_NOISE` noise-only searches),
+  $\Lambda = \max_k (X_k - \mu_k)/\sigma_k$ (Sec. 9) against the Gumbel threshold at `COMPARE_P_FA`.
+
+Thick lines count single runs; dashed lines count an injection as found when any of its `COMPARE_N_SEEDS` restarts is
+(best-of-seeds, which would need its own background for a false-alarm rate). Results are saved per statistic in
+`RESULTS_DIR/compare_<statistic>.npz`; with `COMPARE_RESUME` a rerun skips finished statistics.
+
+**Cost.** `len(COMPARE_STATISTICS)` × (sources × SNRs × seeds + noise sets) × durations optimisations (printed below).
+A Fresnel optimisation of the toy takes ~1 min on an M3 Pro; time one `"H"` run before a long campaign.
+$H$ reads a coherent FFT over `H_BAND` ($\approx 6\times10^5$ bins for 1 yr), so set `BATCH_SIZE` (e.g. 32) for long data.
+""")
+
+code(r"""
+true_model = FEWHarmonicTrackModel(full.t_alpha, m=2, n=0)
+
+
+def draw_sources(n, seed):
+    # Table 1 sources, each plunging at the end of a random duration of the grid, starting inside F0_RANGE.
+    rng = np.random.default_rng(seed)
+    lo_p = np.array([BANK_PRIOR[k][0] for k in ("log10_m1", "m2", "a", "e_f")])
+    hi_p = np.array([BANK_PRIOR[k][1] for k in ("log10_m1", "m2", "a", "e_f")])
+    sources = []
+    while len(sources) < n:
+        log10_m1, m2, a, e_f = rng.uniform(lo_p, hi_p)
+        n_pl = int(rng.choice(DURATIONS))
+        T_pl = (YRSID_SI + probe.shift_for_plunge(n_pl * T_SFT) * T_SFT) / YRSID_SI
+        params = (10**log10_m1, m2, a, T_pl, e_f)
+        try:
+            f = true_model(params).f
+        except Exception:      # FEW cannot integrate this draw back to t = 0
+            continue
+        if F0_RANGE[0] <= f[0] <= F0_RANGE[1]:
+            sources.append(params)
+    return sources
+
+
+def agreement(best_f, true_f):
+    # Fraction of the true track's in-band segments that the best track follows within LOC_TOL_BINS bins.
+    valid = true_f > MASK.f_min
+    if not valid.any():
+        return 0.0
+    return float(np.mean(np.abs(best_f[valid] - true_f[valid]) < LOC_TOL_BINS / T_SFT))
+
+
+compare_sources = draw_sources(COMPARE_N_SOURCES, COMPARE_SEED)
+for i, src in enumerate(compare_sources):
+    print(f"source {i}: m1 = {src[0]:.3g}, m2 = {src[1]:.1f}, a = {src[2]:.2f}, T_pl = {src[3]:.3f} yr, e_f = {src[4]:.3f}")
+n_runs = len(COMPARE_STATISTICS) * (COMPARE_N_SOURCES * len(COMPARE_SNRS) * COMPARE_N_SEEDS + COMPARE_N_NOISE) * len(DURATIONS)
+print(f"{n_runs} optimisations in total")
+""")
+
+code(r"""
+def run_comparison(statistic, sources):
+    path = os.path.join(RESULTS_DIR, f"compare_{statistic}.npz")
+    if COMPARE_RESUME and os.path.exists(path):
+        print(f"[{statistic}] loaded {path}")
+        return dict(np.load(path))
+    shape = (len(sources), len(COMPARE_SNRS), COMPARE_N_SEEDS, len(DURATIONS))
+    X, agree = np.zeros(shape), np.zeros(shape)
+    for i, src in enumerate(sources):
+        noise_i = injection.draw_noise(rng=np.random.default_rng(1_000 * COMPARE_SEED + i))   # paired
+        true_f = true_model(src).f
+        for j, snr in enumerate(COMPARE_SNRS):
+            inj = injector(src, snr, psd, T_data=T_DATA, rng=np.random.default_rng(COMPARE_SEED + i))
+            inj = inj.with_noise(noise=noise_i)
+            for s in range(COMPARE_N_SEEDS):
+                for k, n_seg in enumerate(DURATIONS):
+                    res, _, _ = search_stream(inj, n_seg, seed=100 * s + k, statistic=statistic)
+                    X[i, j, s, k] = res.best_statistic
+                    agree[i, j, s, k] = agreement(np.asarray(res.best_track.f), true_f[:n_seg])
+            print(f"{elapsed()} [{statistic}] source {i + 1}/{len(sources)}, SNR {snr:g}: "
+                  f"best per duration {np.round(X[i, j].max(axis=0), 1)}")
+    background = np.zeros((COMPARE_N_NOISE, len(DURATIONS)))
+    for r in range(COMPARE_N_NOISE):
+        noise_r = injection.with_noise(rng=np.random.default_rng(30_000 + r))
+        for k, n_seg in enumerate(DURATIONS):
+            res, _, _ = search_stream(noise_r, n_seg, seed=5_000 + 100 * r + k, signal=False, statistic=statistic)
+            background[r, k] = res.best_statistic
+        print(f"{elapsed()} [{statistic}] noise set {r + 1}/{COMPARE_N_NOISE}: max {background[r].max():.1f}")
+    out = dict(X=X, agree=agree, background=background, durations=np.asarray(DURATIONS),
+               snrs=np.asarray(COMPARE_SNRS), sources=np.asarray(sources))
+    np.savez(path, **out)
+    return out
+
+
+comparison = {name: run_comparison(name, compare_sources) for name in COMPARE_STATISTICS}
+""")
+
+code(r"""
+summary = {}
+for name, out in comparison.items():
+    B = out["background"]
+    mu, sd = B.mean(axis=0), B.std(axis=0, ddof=1)
+    Z = (out["X"] - mu) / sd                               # (source, SNR, seed, duration)
+    Lam = Z.max(axis=-1)
+    k_star = Z.argmax(axis=-1)
+    agree_star = np.take_along_axis(out["agree"], k_star[..., None], axis=-1)[..., 0]
+    loc, scale = stats.gumbel_r.fit(((B - mu) / sd).max(axis=1))
+    threshold = stats.gumbel_r.isf(COMPARE_P_FA, loc, scale)
+    detected, localised = Lam > threshold, agree_star >= LOC_FRACTION
+    summary[name] = dict(detect=detected.mean(axis=(0, 2)), localise=localised.mean(axis=(0, 2)),
+                         detect_any=detected.any(axis=2).mean(axis=0), localise_any=localised.any(axis=2).mean(axis=0),
+                         threshold=threshold, agree=agree_star.mean(axis=(0, 2)))
+
+print(f"{'statistic':10s} {'SNR':>5s} {'detected':>9s} {'localised':>10s} {'mean agreement':>15s}   threshold")
+for name, r in summary.items():
+    for j, snr in enumerate(COMPARE_SNRS):
+        print(f"{name:10s} {snr:5g} {r['detect'][j]:9.2f} {r['localise'][j]:10.2f} {r['agree'][j]:15.2f}   {r['threshold']:.2f}")
+
+fig, ax = plt.subplots(1, 2, figsize=(11, 3.6), sharey=True)
+for c, (name, r) in enumerate(summary.items()):
+    for a_, key, title in ((ax[0], "detect", f"detected (p_FA = {COMPARE_P_FA:g})"), (ax[1], "localise", "localised")):
+        a_.plot(COMPARE_SNRS, r[key], "o-", color=f"C{c}", lw=2, label=name)
+        a_.plot(COMPARE_SNRS, r[key + "_any"], "--", color=f"C{c}", label=f"{name}, best of {COMPARE_N_SEEDS}")
+        a_.set_title(title); a_.set_xlabel("injected SNR")
+ax[0].set_ylabel("fraction of runs"); ax[0].set_ylim(-0.05, 1.05); ax[1].legend()
+plt.tight_layout()
+""")
+
+md(r"""
+## 11. Producing the paper's results
 
 1. Switch every input above to its `# PAPER:` value (1 yr data, 48 durations, 1024 → 512 members, 525 iterations,
    $f_0 \in [5\times10^{-4}, 10^{-2}]$ Hz, `N_NOISE = 100`); on a 64 GB laptop `BATCH_SIZE = 256` or `None`.
