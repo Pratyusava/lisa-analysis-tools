@@ -223,6 +223,7 @@ md(r"""
 | `H_DELAY_STEP` | $\delta\tau$ | Target spacing of the delay grid [s] |
 | `H_NORMALIZATION` | $Q(N)$ | `"exact"`: finite-window variance per template; `"asymptotic"`: the draft's large-window $R = L/K$ |
 | `H_WINDOW_ALPHA` | | Tukey taper of the stream before its FFT. Each search duration cuts the stream, and the FFT wraps the cut end onto the start: untapered, that step in the steep low-frequency noise whitens into a loud transient at delay 0, which $H$ sums into values in the thousands on pure noise |
+| `H_SPANS` | | Template widths [Hz] the population is sorted by: each member is scored on the narrowest window of bins that holds its template instead of on all of `H_BAND`. Exact (it only skips bins where the template is zero) and ~1.5$\times$ faster on the toy; `None` scores every member on the whole band |
 """)
 
 code(r"""
@@ -234,6 +235,7 @@ H_WINDOWS = (2e3, 4.2e3, 1.72e4, 6.9e4)                   # CB-R draft: {10, 21,
 H_DELAY_STEP = 200.0                                      # CB-R draft: ~200 s
 H_NORMALIZATION = "exact"                                 # CB-R draft: "asymptotic"
 H_WINDOW_ALPHA = 0.01                                     # 0 = rectangular (do not: see the table)
+H_SPANS = (2.5e-3, 5e-3, 1e-2)                            # None = whole band (same result, slower)
 """)
 
 md(r"""
@@ -711,7 +713,8 @@ def search_stream(stream, n_seg, seed, signal=True, statistic=None):
     data, stat, t_alpha = make_data_and_statistic(stream, n_seg, signal, statistic)
     model = SVDTrackModel(basis, t_alpha, T_ref=T_REF, force_backend="jax")
     search = EMRISearch(data, stat, model, make_optimizer(), n_initial=N_INITIAL,
-                        n_population=N_POPULATION, initial_kwargs={"f0_range": F0_RANGE})
+                        n_population=N_POPULATION, initial_kwargs={"f0_range": F0_RANGE},
+                        spans=H_SPANS if isinstance(stat, ExcessPowerStatistic) else None)
     return search.run(T_pl=n_seg * T_SFT, seed=seed), data, stat
 """)
 

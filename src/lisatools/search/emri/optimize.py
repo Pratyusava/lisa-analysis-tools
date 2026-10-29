@@ -3,7 +3,9 @@
 An optimiser minimises ``loss(x)`` over a population of unit-cube points
 ``x`` (shape ``(n, ndim)``) via :meth:`Optimizer.run`, which returns an
 :class:`OptimizationResult`. ``loss`` takes one point; optimisers map / grad
-it over the population themselves (:func:`population_map`).
+it over the population themselves (:func:`population_evaluator`). A
+:class:`BucketedLoss` lets each member be scored by the cheapest of several
+exact implementations of the loss.
 
 * :class:`DifferentialEvolution` -- gradient-free DE with greedy selection.
 * :class:`AdamDE` -- Lorenzo Speri's hybrid: one Adam step on every member,
@@ -49,6 +51,67 @@ def population_map(fn, batch_size=None):
         return jax.vmap(fn)
     batch_size = int(batch_size)
     return lambda x: jax.lax.map(fn, x, batch_size=batch_size)
+
+
+@dataclass(frozen=True)
+class BucketedLoss:
+    """One loss with several exact implementations, picked per point.
+
+    ``losses[bucket(x)](x)`` must equal ``losses[-1](x)`` (and so must its
+    gradient) for every ``x``; ``losses`` go from cheapest to most general,
+    and ``bucket`` (traceable) returns the cheapest one valid at ``x``. A JAX
+    population cannot branch per member inside ``vmap``, so
+    :func:`population_evaluator` sorts the members by bucket on the host and
+    scores each group with its own compiled function, ``chunk_size`` members
+    per call (one compiled shape per bucket; the last chunk is padded).
+    Calling the object evaluates the general loss.
+    """
+
+    losses: tuple
+    bucket: Callable
+    chunk_size: Optional[int] = None
+
+    def __call__(self, x):
+        return self.losses[-1](x)
+
+
+def population_evaluator(loss, transform=None, batch_size=None):
+    """Compiled ``transform(loss)`` over a population, ``(n, ndim) -> (n, ...)``.
+
+    ``transform`` maps a per-point function to another (e.g.
+    ``jax.value_and_grad``; ``None``: the loss itself). A plain ``loss`` is
+    mapped by :func:`population_map` with ``batch_size``. A
+    :class:`BucketedLoss` is dispatched per bucket in chunks of its
+    ``chunk_size`` members (default 16, or ``batch_size`` when smaller: small
+    chunks waste less on padding, and a chunk bounds the memory as
+    ``batch_size`` does).
+    """
+    jax, jnp = _jax()
+    transform = transform or (lambda fn: fn)
+    if not isinstance(loss, BucketedLoss):
+        return jax.jit(population_map(transform(loss), batch_size))
+
+    tree_map = jax.tree_util.tree_map
+    chunk = int(loss.chunk_size or min(16, batch_size or 16))
+    fns = [jax.jit(jax.vmap(transform(fn))) for fn in loss.losses]
+    which = jax.jit(jax.vmap(loss.bucket))
+
+    def evaluate(x):
+        x = jnp.asarray(x)
+        b = np.clip(np.asarray(which(x)), 0, len(fns) - 1)
+        index, parts = [], []
+        for j, fn in enumerate(fns):
+            members = np.flatnonzero(b == j)
+            for start in range(0, members.size, chunk):
+                sel = members[start : start + chunk]
+                padded = np.concatenate([sel, np.full(chunk - sel.size, sel[0])])
+                parts.append(tree_map(lambda r, m=sel.size: r[:m], fn(x[padded])))
+                index.append(sel)
+        merged = tree_map(lambda *r: jnp.concatenate(r), *parts)
+        inverse = np.argsort(np.concatenate(index))
+        return tree_map(lambda r: r[inverse], merged)
+
+    return evaluate
 
 
 @dataclass
@@ -123,7 +186,8 @@ def greedy_selection(x, loss, x_trial, loss_trial):
 class Optimizer:
     """Base class. ``save_every`` controls how often :attr:`history` is filled;
     ``batch_size`` evaluates the population that many members at a time
-    (:func:`population_map`; ``None``: all at once).
+    (:func:`population_evaluator`; ``None``: all at once). ``loss`` may be a
+    :class:`BucketedLoss`.
 
     All randomness comes from the ``key`` passed to :meth:`run`.
     """
@@ -159,7 +223,7 @@ class DifferentialEvolution(_DEOptimizer):
 
     def run(self, loss, x0, key):
         jax, jnp = _jax()
-        batch_loss = jax.jit(population_map(loss, self.batch_size))
+        batch_loss = population_evaluator(loss, batch_size=self.batch_size)
         x = jnp.clip(jnp.asarray(x0), 0.0, 1.0)
         fx = batch_loss(x)
         history = _new_history()
@@ -192,14 +256,18 @@ class AdamDE(_DEOptimizer):
 
     def run(self, loss, x0, key):
         jax, jnp = _jax()
-        value_and_grad = population_map(jax.value_and_grad(loss), self.batch_size)
-        batch_loss = jax.jit(population_map(loss, self.batch_size))
+        value_and_grad = population_evaluator(loss, jax.value_and_grad, self.batch_size)
+        batch_loss = population_evaluator(loss, batch_size=self.batch_size)
 
         @jax.jit
+        def update(x, g, state):
+            upd, state = jax.vmap(self.adam.update)(g, state)
+            return jnp.clip(x + upd, 0.0, 1.0), state
+
         def adam_step(x, state):
             fx, g = value_and_grad(x)
-            upd, state = jax.vmap(self.adam.update)(g, state)
-            return jnp.clip(x + upd, 0.0, 1.0), state, fx
+            x, state = update(x, g, state)
+            return x, state, fx
 
         x = jnp.asarray(x0)
         state = jax.vmap(self.adam.init)(x)

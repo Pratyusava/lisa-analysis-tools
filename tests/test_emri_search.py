@@ -45,7 +45,7 @@ from lisatools.search.emri import (
     gaussian_noise,
     tukey_chirp_kernel,
 )
-from lisatools.search.emri.optimize import de_settings
+from lisatools.search.emri.optimize import BucketedLoss, de_settings, population_evaluator
 from lisatools.utils.constants import YRSID_SI
 
 T_SFT = 5e4
@@ -1021,6 +1021,47 @@ class ExcessPowerTest(unittest.TestCase):
         print(f"[H search] signal {res.best_statistic:.1f}, noise only {noise.best_statistic:.1f}")
         self.assertGreater(res.best_statistic, 3 * noise.best_statistic)
 
+    def test_span_buckets_are_exact(self):
+        """A track scored on a window holding its template gives the whole-band
+        H and gradient; a bucketed loss gives the plain loss on a population."""
+        h, track = self.chirp(2e-11)
+        d = self.fd(h + gaussian_noise(self.n, DT, self.psd, rng=2)[0])
+        full = ExcessPowerStatistic.for_data(d, self.t_alpha, force_backend="cpu")
+        width = float(full.support(track))
+        narrow = full.with_span(1.1 * width)
+        self.assertLess(narrow.n_window, full.n_bins)
+        arr = full.prepare(d)
+        ref = float(full.evaluate(arr, track))
+        self.assertAlmostEqual(float(narrow.evaluate(arr, track)) / ref, 1.0, places=10)
+
+        stat = ExcessPowerStatistic.for_data(d, self.t_alpha, force_backend="jax")
+        model = SVDTrackModel(toy_basis(), self.t_alpha, T_ref=N_SEG * T_SFT, force_backend="jax")
+        kw = dict(initial_kwargs={"f0_range": (2e-3, 4e-3)})
+        plain = EMRISearch(d, stat, model, AdamDE(n_steps=1), **kw)
+        spans = (1e-5, 3e-5)
+        bucketed = EMRISearch(d, stat, model, AdamDE(n_steps=1), spans=spans, **kw)
+        shift = model.shift_for_plunge(N_SEG * T_SFT)
+        arr = stat.prepare(d)
+        loss_b = bucketed.loss_function(arr, shift)
+        self.assertIsInstance(loss_b, BucketedLoss)
+        x = jnp.asarray(model.initial_population(40, seed=0, f0_range=(2e-3, 4e-3)))
+        buckets = np.asarray(jax.vmap(loss_b.bucket)(x))
+        self.assertGreater(len(set(buckets.tolist())), 1)
+        for transform in (None, jax.value_and_grad):
+            want = population_evaluator(plain.loss_function(arr, shift), transform)(x)
+            got = population_evaluator(loss_b, transform, batch_size=8)(x)
+            for w, g in zip(jax.tree_util.tree_leaves(want), jax.tree_util.tree_leaves(got)):
+                np.testing.assert_allclose(np.asarray(g), np.asarray(w), rtol=1e-8, atol=1e-10)
+        with self.assertRaisesRegex(ValueError, "with_span"):
+            sft = SFTData.from_timeseries(np.zeros((1, self.n)), DT, T_SFT, self.psd)
+            EMRISearch(
+                sft,
+                FresnelStatistic.for_data(sft, force_backend="jax"),
+                model,
+                AdamDE(n_steps=1),
+                spans=spans,
+            )
+
     def test_bad_options_raise(self):
         d = self.fd(np.zeros(self.n))
         with self.assertRaisesRegex(ValueError, "amplitude"):
@@ -1055,7 +1096,7 @@ class ExcessPowerTest(unittest.TestCase):
         t = self.t_alpha
         f = 3e-3 + 2e-10 * t + 1.5e-3 * np.sin(t / t[-1] * 5.0)
         track = Track(f, np.gradient(f, t))
-        A, psi, valid = stat.template(track)
+        A, psi, valid, _ = stat.template(track)
         self.assertTrue(valid)
         dt = t[1] - t[0]
         keep = stat.mask(track, dt, np) > 0

@@ -21,9 +21,11 @@ from .kernels import chirp_kernel, jax_chirp_kernel, tukey_chirp_kernel  # noqa:
 from .optimize import (  # noqa: F401
     Adam,
     AdamDE,
+    BucketedLoss,
     DifferentialEvolution,
     OptimizationResult,
     Optimizer,
+    population_evaluator,
     population_map,
 )
 from .pipeline import EMRISearch, SearchResult  # noqa: F401

@@ -16,7 +16,7 @@ from typing import NamedTuple
 
 import numpy as np
 
-from .optimize import OptimizationResult, Optimizer, population_map
+from .optimize import BucketedLoss, OptimizationResult, Optimizer, population_evaluator
 from .statistic import Statistic
 
 
@@ -44,6 +44,12 @@ class EMRISearch:
         n_population: Population the optimiser works on.
         initial_kwargs: Forwarded to ``track_model.initial_population`` (e.g.
             ``f0_range``).
+        spans: Template widths [Hz] to bucket the population by (statistics
+            with ``with_span`` / ``support``, e.g.
+            :class:`~.excess_power.ExcessPowerStatistic`): each member is
+            scored on the narrowest window that holds its template, the rest on
+            the statistic as given. Exact; it only skips empty bins.
+            ``None`` (default): no bucketing.
     """
 
     def __init__(
@@ -55,6 +61,7 @@ class EMRISearch:
         n_initial=128,
         n_population=64,
         initial_kwargs=None,
+        spans=None,
     ):
         for name, part in (("statistic", statistic), ("track model", track_model)):
             if not part.backend.name.endswith("jax"):
@@ -69,6 +76,12 @@ class EMRISearch:
         self.n_initial = int(n_initial)
         self.n_population = int(n_population)
         self.initial_kwargs = dict(initial_kwargs or {})
+        self.spans = None if spans is None else tuple(sorted(float(s) for s in spans))
+        if self.spans is not None and not hasattr(statistic, "with_span"):
+            raise ValueError(
+                f"{type(statistic).__name__} has no with_span / support; spans need a "
+                "windowed statistic such as ExcessPowerStatistic."
+            )
         self._check_band()
 
     def _check_band(self):
@@ -96,13 +109,25 @@ class EMRISearch:
 
     def loss_function(self, arr, shift):
         """``x -> -statistic`` for one trial plunge (the optimiser's objective);
-        ``arr`` is the statistic's data array (:meth:`~.statistic.Statistic.prepare`)."""
+        ``arr`` is the statistic's data array (:meth:`~.statistic.Statistic.prepare`).
+        A :class:`~.optimize.BucketedLoss` when :attr:`spans` is set."""
         stat, model = self.statistic, self.track_model
 
-        def loss(x):
-            return -stat.evaluate(arr, model(x, shift))
+        def make_loss(st):
+            def loss(x):
+                return -st.evaluate(arr, model(x, shift))
 
-        return loss
+            return loss
+
+        if self.spans is None:
+            return make_loss(stat)
+        spans = np.asarray(self.spans)
+
+        def bucket(x):
+            return self.statistic.xp.sum(stat.support(model(x, shift)) > spans)
+
+        losses = tuple(make_loss(stat.with_span(s)) for s in self.spans) + (make_loss(stat),)
+        return BucketedLoss(losses, bucket)
 
     def run(self, T_pl, seed=0, data=None, x0=None) -> SearchResult:
         """Search one trial plunge time ``T_pl`` [s].
@@ -122,7 +147,7 @@ class EMRISearch:
             )
             x0 = self.statistic.xp.asarray(x0)
             batch_size = getattr(self.optimizer, "batch_size", None)
-            initial_loss = jax.jit(population_map(loss, batch_size))(x0)
+            initial_loss = population_evaluator(loss, batch_size=batch_size)(x0)
             x0 = x0[np.argsort(np.asarray(initial_loss))[: self.n_population]]
 
         result = self.optimizer.run(loss, x0, jax.random.PRNGKey(seed))

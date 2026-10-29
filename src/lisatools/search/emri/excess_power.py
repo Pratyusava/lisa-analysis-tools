@@ -36,6 +36,8 @@ spans. Neither LISA's response nor the harmonic's amplitude evolution is in
 the template.
 """
 
+import copy
+
 import numpy as np
 from scipy.fft import next_fast_len
 
@@ -67,6 +69,14 @@ class DelayCorrelationStatistic(Statistic):
             The default drops the semi-coherent linear-chirp cut, which does
             not apply to a coherent template.
         fdot_floor: Smallest ``fdot`` [Hz/s] in the ``"spa"`` amplitude.
+        span: Evaluate on a window of ``span`` [Hz] (plus two bins) starting at
+            the track's lowest frequency instead of on the whole band; ``None``
+            (default) is the whole band. Exact for a track whose
+            :meth:`support` width is at most ``span``: its template is zero
+            outside the window, and moving the window only multiplies ``rho_j``
+            by a phase. Cost scales with the window, so a population sorted by
+            width (:meth:`with_span`, :class:`~.optimize.BucketedLoss`) skips
+            the empty bins of the narrow templates.
         force_backend: ``"cpu"`` (NumPy) or ``"jax"``.
     """
 
@@ -81,6 +91,7 @@ class DelayCorrelationStatistic(Statistic):
         amplitude="spa",
         mask=SegmentMask(dphi_max=None),
         fdot_floor=1e-16,
+        span=None,
         force_backend=None,
     ):
         super().__init__(force_backend=force_backend)
@@ -104,6 +115,19 @@ class DelayCorrelationStatistic(Statistic):
         self.freqs = (self.first_bin + np.arange(self.n_bins)) * self.df
         self.psd_bins = np.asarray(psd(self.freqs), dtype=float)
         self.n_fft = next_fast_len(int(np.ceil(self.T / float(delay_step))))
+        self._set_span(span)
+
+    def _set_span(self, span):
+        self.span = None if span is None else float(span)
+        self.n_window = (
+            self.n_bins if span is None else min(self.n_bins, int(np.ceil(span / self.df)) + 2)
+        )
+
+    def with_span(self, span):
+        """A copy evaluated on windows of ``span`` [Hz] (``None``: whole band)."""
+        new = copy.copy(self)
+        new._set_span(span)
+        return new
 
     @classmethod
     def for_data(cls, data, t_alpha, **kwargs):
@@ -136,15 +160,60 @@ class DelayCorrelationStatistic(Statistic):
         the last axis: :meth:`fold`, then one ``M``-point inverse FFT."""
         return self.xp.fft.ifft(self.fold(x), n=self.n_fft, axis=-1) * self.n_fft
 
-    def _bracket(self, f_up):
-        """For every bin ``f_k``: the knot interval ``i`` with
+    def _take(self, x, k0):
+        """Bins ``k0 .. k0 + n_window`` of ``x`` along its last axis."""
+        if self.n_window == self.n_bins:
+            return x
+        if self.is_jax:
+            import jax
+
+            return jax.lax.dynamic_slice_in_dim(x, k0, self.n_window, axis=-1)
+        return x[..., int(k0) : int(k0) + self.n_window]
+
+    def _knots(self, track: Track):
+        """Masked knots ``(t, f, fdot)`` (last one extended through its segment),
+        the running maximum ``f_up`` of ``f``, and the lowest kept frequency."""
+        xp = self.xp
+        t = xp.asarray(self.t_alpha)
+        dt_track = float(self.t_alpha[1] - self.t_alpha[0]) if self.t_alpha.size > 1 else 1.0
+        keep = self.mask(track, dt_track, xp) > 0
+        f = xp.where(keep, track.f, 0.0)
+        fdot = xp.where(keep, track.fdot, 0.0)
+        # Samples sit at segment starts: extend the last one through its segment.
+        t = xp.concatenate([t, t[-1:] + dt_track])
+        f = xp.concatenate([f, f[-1:] + fdot[-1:] * dt_track])
+        fdot = xp.concatenate([fdot, fdot[-1:]])
+        f_up = self._cummax(f)  # non-decreasing, so t(f) is single-valued
+        f_lo = xp.min(xp.where(keep, track.f, xp.inf))
+        return t, f, fdot, f_up, f_lo
+
+    def support(self, track: Track):
+        """Width [Hz] of the template's frequency range (``-inf`` when no track
+        sample passes the mask): the window a :attr:`span` must cover."""
+        _, _, _, f_up, f_lo = self._knots(track)
+        return f_up[-1] - f_lo
+
+    def _offset(self, f_lo):
+        """First bin of the window for a template starting at ``f_lo``."""
+        xp = self.xp
+        if self.n_window == self.n_bins:
+            return 0
+        k = xp.floor(xp.where(xp.isfinite(f_lo), f_lo, 0.0) / self.df) - self.first_bin
+        if self.is_jax:
+            import jax
+
+            k = jax.lax.stop_gradient(k)
+        return xp.clip(k, 0, self.n_bins - self.n_window).astype(int)
+
+    def _bracket(self, f_up, k0=0):
+        """For every window bin ``f_k``: the knot interval ``i`` with
         ``f_up[i] <= f_k < f_up[i + 1]`` (clipped to the ends) and the linear
         weight in it, i.e. ``np.interp`` on non-decreasing knots. The bins are
         a uniform grid, so each knot's first bin at or above it is arithmetic;
         a cumulative count of those gives ``i`` without searching the bins."""
         xp = self.xp
-        n, m = self.n_bins, f_up.shape[0]
-        pos = f_up / self.df - self.first_bin
+        n, m = self.n_window, f_up.shape[0]
+        pos = f_up / self.df - (self.first_bin + k0)
         if self.is_jax:
             import jax
 
@@ -157,7 +226,7 @@ class DelayCorrelationStatistic(Statistic):
         i = xp.clip(xp.cumsum(counts)[:n] - 1, 0, m - 2)
         lo, hi = f_up[i], f_up[i + 1]
         width = hi - lo
-        f_k = xp.asarray(self.freqs)
+        f_k = (self.first_bin + k0 + xp.arange(n)) * self.df
         w = xp.clip((f_k - lo) / xp.where(width > 0, width, 1.0), 0.0, 1.0)
         # a flat last interval: bins above it take the last knot, as np.interp
         return i, xp.where(width > 0, w, (f_k >= hi).astype(float))
@@ -170,27 +239,20 @@ class DelayCorrelationStatistic(Statistic):
         return np.maximum.accumulate(x)
 
     def template(self, track: Track):
-        """Unit-norm template on the data bins: ``(A_k, Psi_k, valid)``.
+        """Unit-norm template on the window bins: ``(A_k, Psi_k, valid, k0)``.
 
-        ``h_k = A_k e^{-i Psi_k}`` with ``4 df sum_k A_k^2 / S_k = 1``; ``valid``
-        is false (and ``A = 0``) when no track sample passes the mask.
+        ``h_k = A_k e^{-i Psi_k}`` on bins ``k0 .. k0 + n_window`` of the data
+        (all of them, ``k0 = 0``, without a :attr:`span`), with
+        ``4 df sum_k A_k^2 / S_k = 1``; ``valid`` is false (and ``A = 0``) when
+        no track sample passes the mask.
         """
         xp = self.xp
-        f_k = xp.asarray(self.freqs)
-        t = xp.asarray(self.t_alpha)
-        dt_track = float(self.t_alpha[1] - self.t_alpha[0]) if self.t_alpha.size > 1 else 1.0
-        keep = self.mask(track, dt_track, xp) > 0
-        f = xp.where(keep, track.f, 0.0)
-        fdot = xp.where(keep, track.fdot, 0.0)
-        # Samples sit at segment starts: extend the last one through its segment.
-        t = xp.concatenate([t, t[-1:] + dt_track])
-        f = xp.concatenate([f, f[-1:] + fdot[-1:] * dt_track])
-        fdot = xp.concatenate([fdot, fdot[-1:]])
-        f_up = self._cummax(f)  # non-decreasing, so t(f) is single-valued
-        f_lo = xp.min(xp.where(keep, track.f, xp.inf))
+        t, _, fdot, f_up, f_lo = self._knots(track)
+        k0 = self._offset(f_lo)
+        f_k = (self.first_bin + k0 + xp.arange(self.n_window)) * self.df
         inside = (f_k >= f_lo) & (f_k <= f_up[-1])
 
-        i, w = self._bracket(f_up)
+        i, w = self._bracket(f_up, k0)
         t_k = t[i] + w * (t[i + 1] - t[i])
         psi = 2 * np.pi * self.df * (xp.cumsum(t_k) - 0.5 * t_k)
         if self.amplitude == "spa":
@@ -200,20 +262,21 @@ class DelayCorrelationStatistic(Statistic):
             a = xp.ones_like(f_k)
         a = xp.where(inside, a, 0.0)
 
-        S = xp.asarray(self.psd_bins)
+        S = self._take(xp.asarray(self.psd_bins), k0)
         norm = 4 * self.df * xp.sum(a**2 / S)
         valid = norm > 0
         A = a / xp.sqrt(xp.where(valid, norm, 1.0))
-        return A, psi, valid
+        return A, psi, valid, k0
 
     def correlation_power(self, arr, track: Track):
         """``sum_channels |rho_j|^2`` on the delay grid, shape ``(n_fft,)``, and the
-        template ``(A, Psi, valid)``. Noise mean: 2 per channel."""
+        template ``(A, Psi, valid, k0)``. Noise mean: 2 per channel."""
         xp = self.xp
-        A, psi, valid = self.template(track)
-        weight = 4 * self.df * A / xp.asarray(self.psd_bins) * xp.exp(1j * psi)
-        rho = self.delay_transform(arr * weight[None, :])
-        return xp.sum(xp.abs(rho) ** 2, axis=0), (A, psi, valid)
+        A, psi, valid, k0 = self.template(track)
+        S = self._take(xp.asarray(self.psd_bins), k0)
+        weight = 4 * self.df * A / S * xp.exp(1j * psi)
+        rho = self.delay_transform(self._take(arr, k0) * weight[None, :])
+        return xp.sum(xp.abs(rho) ** 2, axis=0), (A, psi, valid, k0)
 
     def reduce(self, power, template, n_channels):
         raise NotImplementedError
@@ -273,10 +336,11 @@ class ExcessPowerStatistic(DelayCorrelationStatistic):
         cells = {min(max(1, int(round(w / self.delay_step))), self.n_fft) for w in windows}
         self.cells = tuple(sorted(cells))
 
-    def window_q(self, A):
-        """``Q(N)`` for each window in :attr:`cells`."""
+    def window_q(self, A, k0=0):
+        """``Q(N)`` for each window in :attr:`cells`, for the template amplitude
+        ``A`` on the window at bin ``k0`` (:meth:`template`)."""
         xp = self.xp
-        b = 4 * self.df * A**2 / xp.asarray(self.psd_bins)
+        b = 4 * self.df * A**2 / self._take(xp.asarray(self.psd_bins), k0)
         if self.normalization == "asymptotic":
             q = self.n_fft * xp.sum(self.fold(b) ** 2)
             return [q for _ in self.cells]
@@ -291,7 +355,7 @@ class ExcessPowerStatistic(DelayCorrelationStatistic):
         n_max = self.cells[-1]
         cs = xp.concatenate([xp.zeros(1), xp.cumsum(xp.concatenate([c, c[:n_max]]))])
         best = []
-        for n, q in zip(self.cells, self.window_q(template[0])):
+        for n, q in zip(self.cells, self.window_q(template[0], template[3])):
             sums = cs[n : n + self.n_fft] - cs[: self.n_fft]
             best.append(xp.max(sums) / xp.sqrt(4.0 * n * n_channels * xp.where(q > 0, q, 1.0)))
         return xp.max(xp.stack(best))
