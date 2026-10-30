@@ -304,6 +304,7 @@ optimiser seeds, same budget), and its detections are thresholded on its **own**
 | Name | Meaning |
 |---|---|
 | `COMPARE_SCALE` | Preset of the four sizes below (`COMPARE_PRESETS`): `"small"` (a few injections, minutes per optimisation count) or `"medium"` (enough injections and noise sets to compare the statistics); it also names the results files |
+| `COMPARE_BUDGETS` | Per preset, the search inputs of Sec. 1f it replaces: `"paper_budget"` repeats the sources, noise and optimiser seeds of the `"medium"` preset at SNR 20 with the paper's population and iterations, and redoes the noise background at that budget |
 | `COMPARE_STATISTICS` | Statistics compared (`"fresnel"`, `"H"`) |
 | `COMPARE_SNRS` | Injected SNRs (over `T_SNR`); each source is injected at every SNR with the same noise |
 | `COMPARE_N_SOURCES` | Sources drawn from the Table 1 priors (`BANK_PRIOR`), each plunging at the end of a random duration of the grid |
@@ -312,7 +313,7 @@ optimiser seeds, same budget), and its detections are thresholded on its **own**
 | `COMPARE_SEED` | Seed of the source draws, angles and noise |
 | `LOC_CRITERIA` | Localisation criteria, name $\to$ (`tol_bins`, `fraction`): a run is localised when its best track is within `tol_bins` / $T_{\rm SFT}$ of the true m=2 track on at least `fraction` of the in-band segments. Applied after the run to the saved best tracks, so they can be changed without rerunning |
 | `COMPARE_P_FA` | False-alarm probability of the detection threshold |
-| `COMPARE_RESUME` | Reuse `compare_<scale>_<statistic>.npz` in `RESULTS_DIR` when present and made with the same settings (restart a long run where it stopped) |
+| `COMPARE_RESUME` | Reuse `compare_<scale>_<statistic>.npz` in `RESULTS_DIR` when present and made with the same settings ; a run in progress checkpoints to `compare_<scale>_<statistic>.partial.npz` and continues from it (at most the optimisations in flight are repeated) |
 | `N_WORKERS` | Optimisations run side by side in separate processes (`lisatools.search.emri.run_tasks`). One JAX process keeps only ~4 of 12 cores busy, so a few workers raise throughput; each holds its own data and compiled functions, so memory grows with it. Results are identical to `N_WORKERS = 1` |
 """)
 
@@ -321,9 +322,15 @@ COMPARE_PRESETS = {
     # name: (SNRs, sources, seeds, noise sets)
     "small": ((20.0, 30.0), 3, 2, 4),
     "medium": ((10.0, 15.0, 20.0), 16, 2, 20),
+    "paper_budget": ((20.0,), 16, 2, 20),
     # PAPER: ((20, 25, 30, 35, 40), 100, 1, 100);  CB-R draft: ((10, 12, 15, 17, 20), 16, 3, 240)
 }
-COMPARE_SCALE = "medium"
+COMPARE_SCALE = "paper_budget"
+COMPARE_BUDGETS = {
+    # preset: search inputs of Sec. 1f it replaces (batch_size 128 keeps memory at the medium run's)
+    "paper_budget": dict(n_population=512, n_steps=525, patience=None, batch_size=128),
+}
+COMPARE_BUDGET = COMPARE_BUDGETS.get(COMPARE_SCALE, {})
 COMPARE_SNRS, COMPARE_N_SOURCES, COMPARE_N_SEEDS, COMPARE_N_NOISE = COMPARE_PRESETS[COMPARE_SCALE]
 COMPARE_STATISTICS = ("fresnel", "H")
 COMPARE_SEED = 7
@@ -694,15 +701,22 @@ As in Lorenzo's loop, the selection compares the trial with the loss *before* th
 """)
 
 code(r"""
-def make_optimizer():
+def search_budget(**overrides):
+    # The search inputs of Sec. 1f, with `overrides`.
+    return {"n_population": N_POPULATION, "n_steps": N_STEPS, "patience": PATIENCE, "batch_size": BATCH_SIZE,
+            **overrides}
+
+
+def make_optimizer(**overrides):
+    budget = search_budget(**overrides)
     return AdamDE(
-        n_steps=N_STEPS,
+        n_steps=budget["n_steps"],
         adam=Adam(learning_rate=LEARNING_RATE),
         F_range=F_RANGE,
         p_elitism=P_ELITISM,
         save_every=10,
-        batch_size=BATCH_SIZE,
-        patience=PATIENCE,
+        batch_size=budget["batch_size"],
+        patience=budget["patience"],
         min_improvement=MIN_IMPROVEMENT,
     )
 
@@ -723,13 +737,14 @@ def make_data_and_statistic(stream, n_seg, signal=True, statistic=None, force_ba
     return data, stat, t_alpha
 
 
-def make_search(stream, n_seg, signal=True, statistic=None):
+def make_search(stream, n_seg, signal=True, statistic=None, budget=None):
     # The search of the first n_seg segments of `stream` (an EMRIInjection with fixed noise),
-    # plunge at the end of the stream; signal=False searches its noise alone.
+    # plunge at the end of the stream; signal=False searches its noise alone. budget overrides search_budget().
     data, stat, t_alpha = make_data_and_statistic(stream, n_seg, signal, statistic)
     model = SVDTrackModel(basis, t_alpha, T_ref=T_REF, force_backend="jax")
-    search = EMRISearch(data, stat, model, make_optimizer(), n_initial=N_INITIAL,
-                        n_population=N_POPULATION, initial_kwargs={"f0_range": F0_RANGE},
+    budget = budget or {}
+    search = EMRISearch(data, stat, model, make_optimizer(**budget), n_initial=N_INITIAL,
+                        n_population=search_budget(**budget)["n_population"], initial_kwargs={"f0_range": F0_RANGE},
                         spans=H_SPANS if isinstance(stat, ExcessPowerStatistic) else None)
     return search, data, stat
 
@@ -934,9 +949,9 @@ print(f"{n_runs} optimisations in total")
 """)
 
 code(r"""
-def comparison_tasks(statistic, sources):
+def comparison_tasks(statistic, sources, done_inj, done_noise):
     # Every optimisation of the comparison as a SearchTask, built lazily (one stream at a time).
-    # Tags: ("inj", i, j, s, k) or ("noise", r, k); seeds as in a serial run.
+    # Tags: ("inj", i, j, s, k) or ("noise", r, k); seeds as in a serial run, so skipping the done ones changes nothing.
     for i, src in enumerate(sources):
         noise_i = injection.draw_noise(rng=np.random.default_rng(1_000 * COMPARE_SEED + i))   # paired
         for j, snr in enumerate(COMPARE_SNRS):
@@ -944,13 +959,17 @@ def comparison_tasks(statistic, sources):
             inj = inj.with_noise(noise=noise_i)
             for s in range(COMPARE_N_SEEDS):
                 for k, n_seg in enumerate(DURATIONS):
-                    search, _, _ = make_search(inj, n_seg, statistic=statistic)
+                    if done_inj[i, j, s, k]:
+                        continue
+                    search, _, _ = make_search(inj, n_seg, statistic=statistic, budget=COMPARE_BUDGET)
                     yield SearchTask(search, n_seg * T_SFT, seed=100 * s + k, tag=("inj", i, j, s, k),
                                      keep_history=False)
     for r in range(COMPARE_N_NOISE):
         noise_r = injection.with_noise(rng=np.random.default_rng(30_000 + r))
         for k, n_seg in enumerate(DURATIONS):
-            search, _, _ = make_search(noise_r, n_seg, signal=False, statistic=statistic)
+            if done_noise[r, k]:
+                continue
+            search, _, _ = make_search(noise_r, n_seg, signal=False, statistic=statistic, budget=COMPARE_BUDGET)
             yield SearchTask(search, n_seg * T_SFT, seed=5_000 + 100 * r + k, tag=("noise", r, k),
                              keep_history=False)
 
@@ -959,9 +978,18 @@ def comparison_settings(statistic, sources):
     # What a saved comparison must match to be resumed.
     stat = (P, WINDOW_ALPHA, MASK) if statistic == "fresnel" else (H_BAND, H_WINDOWS, H_DELAY_STEP, H_NORMALIZATION,
                                                                      H_WINDOW_ALPHA)
+    budget = search_budget(**COMPARE_BUDGET)
     return repr((statistic, stat, np.round(sources, 10).tolist(), COMPARE_SNRS, COMPARE_N_SEEDS, COMPARE_N_NOISE,
-                 COMPARE_SEED, list(DURATIONS), T_SFT, T_DATA, N_INITIAL, N_POPULATION, N_STEPS, PATIENCE,
+                 COMPARE_SEED, list(DURATIONS), T_SFT, T_DATA, N_INITIAL, budget["n_population"],
+                 budget["n_steps"], budget["patience"],
                  MIN_IMPROVEMENT, LEARNING_RATE, F_RANGE, P_ELITISM, F0_RANGE))
+
+
+def save_atomic(path, **arrays):
+    # np.savez, never leaving a half-written file at path.
+    tmp = path.replace(".npz", ".tmp.npz")
+    np.savez(tmp, **arrays)
+    os.replace(tmp, path)
 
 
 def run_comparison(statistic, sources):
@@ -977,23 +1005,41 @@ def run_comparison(statistic, sources):
     X = np.zeros(shape)
     best_f = np.full(shape + (max(DURATIONS),), np.nan)          # best track per run, NaN beyond its duration
     background = np.zeros((COMPARE_N_NOISE, len(DURATIONS)))
+    done_inj = np.zeros(shape, dtype=bool)
+    done_noise = np.zeros(background.shape, dtype=bool)
     steps = []
+    partial = path.replace(".npz", ".partial.npz")
+    if COMPARE_RESUME and os.path.exists(partial):
+        saved = dict(np.load(partial))
+        if str(saved["settings"]) == settings:
+            X, best_f, background = saved["X"], saved["best_f"], saved["background"]
+            done_inj, done_noise = saved["done_inj"], saved["done_noise"]
+            steps = saved["iterations"].tolist()
+            print(f"[{statistic}] continuing from {partial}: {len(steps)} optimisations done")
     n_total = int(np.prod(shape)) + background.size
-    for done, (tag, res) in enumerate(run_tasks(comparison_tasks(statistic, sources), n_workers=N_WORKERS), 1):
-        steps.append(res.optimization.history.get("last_step", N_STEPS))
+    n_steps = search_budget(**COMPARE_BUDGET)["n_steps"]
+    tasks = comparison_tasks(statistic, sources, done_inj, done_noise)
+    for done, (tag, res) in enumerate(run_tasks(tasks, n_workers=N_WORKERS), len(steps) + 1):
+        steps.append(res.optimization.history.get("last_step", n_steps))
         if tag[0] == "inj":
             i, j, s, k = tag[1:]
             X[i, j, s, k] = res.best_statistic
             best_f[i, j, s, k, :DURATIONS[k]] = np.asarray(res.best_track.f)
+            done_inj[i, j, s, k] = True
         else:
             background[tag[1], tag[2]] = res.best_statistic
+            done_noise[tag[1], tag[2]] = True
         if done % len(DURATIONS) == 0 or done == n_total:
             print(f"{elapsed()} [{statistic}] {done}/{n_total} optimisations, "
-                  f"mean iterations {np.mean(steps):.0f} of {N_STEPS}")
+                  f"mean iterations {np.mean(steps):.0f} of {n_steps}")
+            save_atomic(partial, X=X, best_f=best_f, background=background, done_inj=done_inj,
+                        done_noise=done_noise, iterations=np.asarray(steps), settings=np.asarray(settings))
     out = dict(X=X, best_f=best_f, background=background, durations=np.asarray(DURATIONS),
                snrs=np.asarray(COMPARE_SNRS), sources=np.asarray(sources), iterations=np.asarray(steps),
                settings=np.asarray(settings))
-    np.savez(path, **out)
+    save_atomic(path, **out)
+    if os.path.exists(partial):
+        os.remove(partial)
     return out
 
 
@@ -1035,7 +1081,8 @@ for name, r in summary.items():
               + f"   {r['threshold']:.2f}")
 for name, r in summary.items():
     print(f"{name}: k* = true plunge duration in {np.mean(r['k_star'] == k_pl[:, None, None]):.0%} of runs; "
-          f"iterations per optimisation: mean {np.mean(r['iterations']):.0f}, min {np.min(r['iterations'])} (of {N_STEPS})")
+          f"iterations per optimisation: mean {np.mean(r['iterations']):.0f}, min {np.min(r['iterations'])} "
+          f"(of {search_budget(**COMPARE_BUDGET)['n_steps']})")
 
 panels = [("detect", f"detected (p_FA = {COMPARE_P_FA:g})")] + [(c, f"localised, {c}") for c in cols]
 fig, ax = plt.subplots(1, len(panels), figsize=(4 * len(panels), 3.6), sharey=True)
@@ -1046,6 +1093,23 @@ for c, (name, r) in enumerate(summary.items()):
         a_.set_title(title, fontsize=10); a_.set_xlabel("injected SNR")
 ax[0].set_ylabel("fraction of runs"); ax[0].set_ylim(-0.05, 1.05); ax[-1].legend(fontsize=8)
 plt.tight_layout()
+""")
+
+code(r"""
+# Why localisation is lower at the true duration: which durations win, and which durations are localised.
+for name, r in summary.items():
+    print(name)
+    for j, snr in enumerate(COMPARE_SNRS):
+        dk = (r["k_star"][:, j] - k_pl[:, None]).ravel()
+        print(f"  SNR {snr:g}: k* = k_pl in {np.mean(dk == 0):.0%}; k* - k_pl histogram (-5..5): "
+              f"{np.bincount(dk + 5, minlength=11)}")
+    for j, snr in enumerate(COMPARE_SNRS):
+        rows = [(k - k_pl[i], agreement(comparison[name]["best_f"][i, j, s, k], true_f[i], LOC_CRITERIA["loose"][0])
+                 >= LOC_CRITERIA["loose"][1])
+                for i, s, k in np.ndindex(COMPARE_N_SOURCES, COMPARE_N_SEEDS, len(DURATIONS))]
+        d, ok = map(np.array, zip(*rows))
+        print(f"  SNR {snr:g}: loose localised by k - k_pl: "
+              f"{ {int(x): round(float(ok[d == x].mean()), 2) for x in np.unique(d)} }")
 """)
 
 md(r"""
