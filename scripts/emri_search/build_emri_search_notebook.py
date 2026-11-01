@@ -949,14 +949,19 @@ print(f"{n_runs} optimisations in total")
 """)
 
 code(r"""
+def comparison_injection(i, src, snr):
+    # Source i at this SNR on its own noise realisation (paired across SNRs and statistics).
+    noise_i = injection.draw_noise(rng=np.random.default_rng(1_000 * COMPARE_SEED + i))
+    inj = injector(src, snr, psd, T_data=T_DATA, rng=np.random.default_rng(COMPARE_SEED + i))
+    return inj.with_noise(noise=noise_i)
+
+
 def comparison_tasks(statistic, sources, done_inj, done_noise):
     # Every optimisation of the comparison as a SearchTask, built lazily (one stream at a time).
     # Tags: ("inj", i, j, s, k) or ("noise", r, k); seeds as in a serial run, so skipping the done ones changes nothing.
     for i, src in enumerate(sources):
-        noise_i = injection.draw_noise(rng=np.random.default_rng(1_000 * COMPARE_SEED + i))   # paired
         for j, snr in enumerate(COMPARE_SNRS):
-            inj = injector(src, snr, psd, T_data=T_DATA, rng=np.random.default_rng(COMPARE_SEED + i))
-            inj = inj.with_noise(noise=noise_i)
+            inj = comparison_injection(i, src, snr)
             for s in range(COMPARE_N_SEEDS):
                 for k, n_seg in enumerate(DURATIONS):
                     if done_inj[i, j, s, k]:
@@ -1110,6 +1115,53 @@ for name, r in summary.items():
         d, ok = map(np.array, zip(*rows))
         print(f"  SNR {snr:g}: loose localised by k - k_pl: "
               f"{ {int(x): round(float(ok[d == x].mean()), 2) for x in np.unique(d)} }")
+""")
+
+code(r"""
+# Found track against true track: score the true m=2 track on the stream of every search (no new search).
+def true_statistics(statistic, sources):
+    # X_true[source, SNR, duration]: the statistic of the true track on the data each search read.
+    X_true = np.zeros((len(sources), len(COMPARE_SNRS), len(DURATIONS)))
+    for i, src in enumerate(sources):
+        track = true_model(src)
+        for j, snr in enumerate(COMPARE_SNRS):
+            inj = comparison_injection(i, src, snr)
+            for k, n_seg in enumerate(DURATIONS):
+                data, stat, _ = make_data_and_statistic(inj, n_seg, statistic=statistic, force_backend="cpu")
+                cut = Track(track.f[:n_seg], track.fdot[:n_seg], track.fddot[:n_seg])
+                X_true[i, j, k] = float(stat.evaluate(stat.prepare(data), cut))
+    return X_true
+
+
+tol, frac = LOC_CRITERIA["loose"]
+for name, out in comparison.items():
+    r = summary[name]
+    mu, sd = out["background"].mean(axis=0), out["background"].std(axis=0, ddof=1)
+    Lam = ((out["X"] - mu) / sd).max(axis=-1)                                      # (source, SNR, seed)
+    Z_true = (true_statistics(name, compare_sources) - mu) / sd                    # (source, SNR, duration)
+    Lam_true = Z_true.max(axis=-1)                                                 # (source, SNR)
+    detected = Lam > r["threshold"]
+    localised = np.zeros(Lam.shape, dtype=bool)
+    for i, j, s in np.ndindex(Lam.shape):
+        k = r["k_star"][i, j, s]
+        localised[i, j, s] = agreement(out["best_f"][i, j, s, k], true_f[i], tol) >= frac
+    found_wins = Lam > Lam_true[:, :, None]
+    print(f"{name}: threshold {r['threshold']:.2f}")
+    for j, snr in enumerate(COMPARE_SNRS):
+        d, l, w = detected[:, j], localised[:, j], found_wins[:, j]
+        print(f"  SNR {snr:g}: {d.size} runs: detected and localised {np.sum(d & l)}, detected only {np.sum(d & ~l)}, "
+              f"localised only {np.sum(~d & l)}, neither {np.sum(~d & ~l)}")
+        print(f"  SNR {snr:g}: the true track would be detected for {np.sum(Lam_true[:, j] > r['threshold'])}"
+              f"/{len(compare_sources)} sources")
+        print(f"  SNR {snr:g}: of {np.sum(~l)} runs not localised, found track beats true track in {np.sum(w & ~l)} "
+              f"(the statistic's maximum is elsewhere), true beats found in {np.sum(~w & ~l)} (the optimiser missed it)")
+        print(f"  SNR {snr:g}: of {np.sum(l)} runs localised, found track beats true track in {np.sum(w & l)}")
+    j = len(COMPARE_SNRS) - 1
+    print(f"  per source at SNR {COMPARE_SNRS[j]:g}:\n  src  n_pl   m1      m2   Z_true(k_pl)  Lambda_true  Lambda per seed       "
+          "detected  localised")
+    for i, src in enumerate(compare_sources):
+        print(f"  {i:3d}  {compare_plunges[i]:4d}  {src[0]:.2e} {src[1]:5.1f}  {Z_true[i, j, k_pl[i]]:11.2f}  {Lam_true[i, j]:11.2f}  "
+              f"{' '.join(f'{x:8.2f}' for x in Lam[i, j])}  {detected[i, j].sum():8d}  {localised[i, j].sum():9d}")
 """)
 
 md(r"""
