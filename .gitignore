@@ -169,3 +169,6 @@ gf_output_noise/
 
 # the flagship one-off launchers (scripts/flagship/build.py --set ... --out)
 scripts/flagship/oneoff/
+
+# macOS
+.DS_Store

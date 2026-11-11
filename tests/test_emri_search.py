@@ -46,6 +46,7 @@ from lisatools.search.emri import (
     tukey_chirp_kernel,
 )
 from lisatools.search.emri.optimize import BucketedLoss, de_settings, population_evaluator
+from lisatools.search.emri.parallel import SearchTask, run_tasks
 from lisatools.utils.constants import YRSID_SI
 
 T_SFT = 5e4
@@ -654,6 +655,21 @@ class OptimizerTest(unittest.TestCase):
         np.testing.assert_allclose(result.loss, jax.vmap(self.loss)(result.x), rtol=0, atol=1e-14)
         self.assertTrue(np.all((np.asarray(result.x) >= 0) & (np.asarray(result.x) <= 1)))
 
+    def test_early_stopping(self):
+        """A run stopped by patience is the fixed-length run ending at that step."""
+        x0 = self.x0()
+        for cls in (DifferentialEvolution, AdamDE):
+            full = cls(n_steps=40, save_every=10).run(self.loss, x0, jax.random.PRNGKey(3))
+            self.assertEqual(full.history["last_step"], 40)
+            early = cls(n_steps=400, save_every=10, patience=3, min_improvement=0.05).run(
+                self.loss, x0, jax.random.PRNGKey(3)
+            )
+            last = early.history["last_step"]
+            self.assertLess(last, 400, cls.__name__)
+            self.assertEqual(early.history["step"][-1], last)
+            same = cls(n_steps=last, save_every=10).run(self.loss, x0, jax.random.PRNGKey(3))
+            np.testing.assert_array_equal(np.asarray(early.x), np.asarray(same.x))
+
 
 @unittest.skipUnless(HAVE_JAX, "jax not installed")
 class OptimizerParityTest(unittest.TestCase):
@@ -867,6 +883,18 @@ class SearchTest(unittest.TestCase):
         a, b = (s.run(T_pl=N_SEG * T_SFT, seed=0) for s in (full, batched))
         np.testing.assert_allclose(b.best_x, a.best_x, rtol=0, atol=1e-12)
         self.assertAlmostEqual(b.best_statistic, a.best_statistic, places=8)
+
+    def test_parallel_tasks(self):
+        """Searches in spawned workers return what they return in this process."""
+        search = self.make_search(n_steps=3)
+        tasks = [SearchTask(search, N_SEG * T_SFT, seed=s, tag=s) for s in range(3)]
+        serial = dict(run_tasks(tasks))
+        parallel = dict(run_tasks(tasks, n_workers=2, max_pending=2))
+        self.assertEqual(sorted(parallel), [0, 1, 2])
+        for s in range(3):
+            self.assertEqual(parallel[s].best_statistic, serial[s].best_statistic)
+            np.testing.assert_array_equal(parallel[s].best_track.f, serial[s].best_track.f)
+            self.assertIsInstance(parallel[s].best_track.f, np.ndarray)
 
     def test_config_pickles(self):
         search = self.make_search(n_steps=1)

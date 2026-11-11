@@ -8,7 +8,7 @@ Bustamante-Rosell's `H` statistic). Everything runs on the CPU with JAX.
 |---|---|
 | `setup_env_macos.sh` | Builds the `lat-emri` conda environment (dev stack + search extras) |
 | `emri_search_lorenzo.ipynb` | The notebook, committed with the toy run's outputs |
-| `build_emri_search_notebook.py` | Regenerates the notebook (unexecuted): `python build_emri_search_notebook.py` |
+| `build_emri_search_notebook.py` | The notebook's source: regenerates it, keeping the outputs of unchanged cells (see *Editing the notebook*) |
 
 ## Setup
 
@@ -88,8 +88,17 @@ caffeinate -i jupyter nbconvert --to notebook --execute --inplace \
   --ExecutePreprocessor.timeout=-1 emri_search_lorenzo.ipynb > run.log 2>&1 &
 ```
 
-Sec. 10 saves each statistic's results to `results_*/compare_<statistic>.npz`; with
-`COMPARE_RESUME = True` a rerun skips the finished ones.
+Sec. 10 saves each statistic's results to `results_*/compare_<scale>_<statistic>.npz`; with
+`COMPARE_RESUME = True` a rerun skips the finished ones and continues a partial one.
+
+## Editing the notebook
+
+`build_emri_search_notebook.py` is the source of truth: edit it, then run
+`python build_emri_search_notebook.py` in this folder. The existing notebook's executed outputs are
+carried over to every cell whose code is unchanged; the cells whose code changed are listed and must be
+re-executed (open the notebook, run them, save). `--fresh` writes an unexecuted notebook. Edits made to
+the `.ipynb` itself are lost at the next regeneration, so put them in the generator; running cells in
+Jupyter and saving is fine, the outputs are picked up.
 
 **Memory (`BATCH_SIZE`, 64 GB machine):** toy runs `None`; paper settings with `"fresnel"`
 `256` (or `None`); paper settings with `"H"` start at `32` (its FFT has ~6×10⁵ bins for 1 yr).
