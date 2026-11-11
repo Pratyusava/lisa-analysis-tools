@@ -568,6 +568,73 @@ class InitialPopulationTest(unittest.TestCase):
             self.model.initial_population(8, seed=0, out_of_cube="reject")
 
 
+class SVDBasisBuildTest(unittest.TestCase):
+    def setUp(self):
+        t = np.arange(N_SEG) * T_SFT
+        rng = np.random.default_rng(3)
+        self.bank = rng.uniform(2e-3, 4e-3, (300, 1)) + rng.uniform(1e-11, 4e-11, (300, 1)) * t
+
+    def test_box_quantile(self):
+        full = SVDBasis.build(self.bank, n_modes=2)
+        U, S, _ = np.linalg.svd(self.bank, full_matrices=False)
+        coeffs = U[:, :2] * S[:2]
+        np.testing.assert_allclose(full.lb, coeffs.min(axis=0))
+        np.testing.assert_allclose(full.ub, coeffs.max(axis=0))
+        cut = SVDBasis.build(self.bank, n_modes=2, box_quantile=0.1)
+        np.testing.assert_allclose(cut.lb, np.quantile(coeffs, 0.1, axis=0))
+        np.testing.assert_allclose(cut.ub, np.quantile(coeffs, 0.9, axis=0))
+        self.assertTrue(np.all(cut.lb > full.lb) and np.all(cut.ub < full.ub))
+        top = SVDBasis.build(self.bank, n_modes=2, box_quantile=0.1, first_mode_max=True)
+        self.assertEqual(top.ub[0], coeffs[:, 0].max())
+        np.testing.assert_allclose(top.ub[1:], cut.ub[1:])
+        np.testing.assert_allclose(top.lb, cut.lb)
+        np.testing.assert_allclose(top.V, cut.V)
+        with self.assertRaises(ValueError):
+            SVDBasis.build(self.bank, n_modes=2, box_quantile=0.5)
+
+    def test_npz_round_trip(self):
+        import tempfile
+
+        basis = SVDBasis.build(self.bank, n_modes=2, box_quantile=0.05, first_mode_max=True)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "basis.npz")
+            basis.save_npz(path)
+            back = SVDBasis.from_npz(path)
+        for name in ("V", "lb", "ub", "S"):
+            np.testing.assert_array_equal(getattr(back, name), getattr(basis, name))
+
+    def test_few_track_bank(self):
+        try:
+            import few  # noqa: F401
+        except ImportError:  # pragma: no cover
+            raise unittest.SkipTest("FEW not installed")
+        from lisatools.search.emri import FEWHarmonicTrackModel, few_track_bank
+
+        T_ref = 0.1 * YRSID_SI
+        t = np.arange(0.0, T_ref, T_SFT)  # 64 samples; the last segment ends after T_ref
+        prior = {"log10_m1": (6.0, 6.3), "m2": (10.0, 30.0), "a": (0.3, 0.9), "e_f": (0.0, 0.1)}
+        tracks, params = few_track_bank(prior, 3, t, T_ref, seed=5)
+        self.assertEqual(tracks.shape, (3, t.size))
+        self.assertEqual(params.shape, (3, 4))
+        self.assertTrue(np.all(tracks[:, 0] > 0.0))
+        self.assertTrue(np.all(tracks[:, t + T_SFT > T_ref] == 0.0))
+        self.assertTrue(np.all(tracks[:, t + T_SFT <= T_ref] > 0.0))
+        lo, hi = [6.0, 10.0, 0.3, 0.0], [6.3, 30.0, 0.9, 0.1]
+        self.assertTrue(np.all((params >= lo) & (params <= hi)))
+        # The kept draws, recomputed one by one, give the same tracks.
+        model = FEWHarmonicTrackModel(t, m=2, n=0)
+        for f, (log10_m1, m2, a, e_f) in zip(tracks, params):
+            ref = model((10**log10_m1, m2, a, T_ref / YRSID_SI, e_f)).f
+            ref[t + T_SFT > T_ref] = 0.0
+            np.testing.assert_array_equal(f, ref)
+        again, _ = few_track_bank(prior, 3, t, T_ref, seed=5)
+        np.testing.assert_array_equal(again, tracks)
+        basis = SVDBasis.build(tracks, n_modes=2, box_quantile=0.0, first_mode_max=True)
+        self.assertEqual((basis.n_modes, basis.n_samples), (2, t.size))
+        with self.assertRaises(RuntimeError):
+            few_track_bank(prior, 3, t, T_ref, seed=5, max_draws=0)
+
+
 class ShiftTest(unittest.TestCase):
     def setUp(self):
         self.basis = toy_basis(n_samples=N_SEG + 6)

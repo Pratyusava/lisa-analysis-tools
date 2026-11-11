@@ -79,7 +79,9 @@ jupyter lab emri_search_lorenzo.ipynb
 - Results go to `results_toy/` (or `results_paper/`) next to the notebook; git ignores them.
 - Inputs are in Sec. 1: the toy values are active, the paper's (`# PAPER:`), Lorenzo's repo's
   (`# REPO:`) and the Cutler & Bustamante-Rosell draft's (`# CB-R draft:`) are commented next to
-  each one. `STATISTIC` picks `"fresnel"` (Lorenzo) or `"H"`.
+  each one. `STATISTIC` picks `"fresnel"` (Lorenzo) or `"H"`; `BASIS_SOURCE` picks `"file"` (Lorenzo's basis,
+  or an `.npz` saved by a build) or `"build"` (the SVD of a FEW track bank with the Sec. 1d inputs, saved to
+  `BASIS_SAVE`).
 
 Long runs (e.g. the Sec. 10 statistic comparison), headless and with the Mac kept awake:
 
@@ -96,9 +98,11 @@ Sec. 10 saves each statistic's results to `results_*/compare_<scale>_<statistic>
 `build_emri_search_notebook.py` is the source of truth: edit it, then run
 `python build_emri_search_notebook.py` in this folder. The existing notebook's executed outputs are
 carried over to every cell whose code is unchanged; the cells whose code changed are listed and must be
-re-executed (open the notebook, run them, save). `--fresh` writes an unexecuted notebook. Edits made to
-the `.ipynb` itself are lost at the next regeneration, so put them in the generator; running cells in
-Jupyter and saving is fine, the outputs are picked up.
+re-executed: open the notebook, run them, save; or `python build_emri_search_notebook.py --run=2,4-18,30`
+executes the listed cells (indices as printed) in one fresh kernel right after regenerating and saves their
+outputs (`--kernel=python3` runs them in the current environment's kernel instead of the notebook's).
+`--fresh` writes an unexecuted notebook. Edits made to the `.ipynb` itself are lost at the next regeneration,
+so put them in the generator; running cells in Jupyter and saving is fine, the outputs are picked up.
 
 **Memory (`BATCH_SIZE`, 64 GB machine):** toy runs `None`; paper settings with `"fresnel"`
 `256` (or `None`); paper settings with `"H"` start at `32` (its FFT has ~6×10⁵ bins for 1 yr).

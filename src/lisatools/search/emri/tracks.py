@@ -63,15 +63,27 @@ class SVDBasis:
         return float(terms.min(axis=0).sum()), float(terms.max(axis=0).sum())
 
     @classmethod
-    def build(cls, tracks, n_modes):
-        """SVD of a training bank of tracks, shape ``(n_tracks, n_samples)``.
+    def build(cls, tracks, n_modes, box_quantile=0.0, first_mode_max=False):
+        """SVD of a training bank of tracks, shape ``(n_tracks, n_samples)``
+        (e.g. :func:`few_track_bank`), truncated to ``n_modes``.
 
-        The coefficient box is the min/max of the training coefficients.
+        The coefficient box is ``[Q_q, Q_(1-q)]`` of the training coefficients
+        per mode, ``q = box_quantile`` (``0``: their min / max). With
+        ``first_mode_max`` the upper edge of the first mode is the maximum
+        instead of ``Q_(1-q)``, so the highest-frequency training tracks stay
+        inside the box; ``box_quantile=0.015, first_mode_max=True`` reproduces
+        the box of EMRI-Search's basis file.
         """
         tracks = np.asarray(tracks, dtype=float)
+        if not 0.0 <= box_quantile < 0.5:
+            raise ValueError(f"box_quantile must be in [0, 0.5), not {box_quantile}.")
         U, S, Vt = np.linalg.svd(tracks, full_matrices=False)
         coeffs = U[:, :n_modes] * S[:n_modes]
-        return cls(Vt[:n_modes], coeffs.min(axis=0), coeffs.max(axis=0), S=S[:n_modes])
+        lb = np.quantile(coeffs, box_quantile, axis=0)
+        ub = np.quantile(coeffs, 1.0 - box_quantile, axis=0)
+        if first_mode_max:
+            ub[0] = coeffs[:, 0].max()
+        return cls(Vt[:n_modes], lb, ub, S=S[:n_modes])
 
     @classmethod
     def from_npz(cls, path):
@@ -251,6 +263,64 @@ class FEWHarmonicTrackModel(LISAToolsParallelModule):
         _, f, fdot, fddot = self.phases_and_derivatives(*params)
         w = np.array([self.m, self.n])
         return Track(w @ f, w @ fdot, w @ fddot)
+
+
+def few_track_bank(prior, n_tracks, t_alpha, T_ref, seed=None, m=2, n=0, err=1e-11, max_draws=None):
+    """A bank of FEW harmonic tracks plunging at ``T_ref``, for :meth:`SVDBasis.build`.
+
+    Draws ``(log10 m1, m2, a, e_f)`` uniformly in ``prior`` (a dict of
+    ``(low, high)`` under the keys ``"log10_m1", "m2", "a", "e_f"``; prograde
+    orbits) and keeps a draw when its ``m Phi_phi + n Phi_r`` track
+    (:class:`FEWHarmonicTrackModel`) spans the whole grid ``t_alpha`` [s], i.e.
+    the inspiral integrated back from the plunge at ``T_ref`` [s] reaches
+    ``t_alpha[0]``; draws FEW cannot integrate back that far are discarded.
+    Segments that do not complete before the plunge (``t + T_sft > T_ref``,
+    with ``T_sft`` the grid spacing) are set to zero, as in EMRI-Search's bank.
+
+    Args:
+        prior: Uniform ranges of the four parameters.
+        n_tracks: Tracks in the bank; drawing continues until there are that many
+            (at most ``max_draws`` draws, default ``20 * n_tracks``).
+        t_alpha: Segment start times of the basis [s], e.g.
+            ``np.arange(0, T_ref, T_sft)``.
+        T_ref: Plunge time of every track [s].
+        seed: Seed of the draws.
+        m, n, err: Harmonic and integrator tolerance (:class:`FEWHarmonicTrackModel`).
+
+    Returns:
+        ``(tracks, params)``: the tracks, shape ``(n_tracks, len(t_alpha))`` [Hz],
+        and the kept draws, shape ``(n_tracks, 4)``.
+    """
+    from ...utils.constants import YRSID_SI
+
+    keys = ("log10_m1", "m2", "a", "e_f")
+    lo = np.array([prior[k][0] for k in keys], dtype=float)
+    hi = np.array([prior[k][1] for k in keys], dtype=float)
+    t_alpha = np.asarray(t_alpha, dtype=float)
+    T_sft = t_alpha[1] - t_alpha[0]
+    incomplete = t_alpha + T_sft > T_ref
+    model = FEWHarmonicTrackModel(t_alpha, m=m, n=n, err=err)
+    rng = np.random.default_rng(seed)
+    max_draws = 20 * n_tracks if max_draws is None else int(max_draws)
+    tracks, params, draws = [], [], 0
+    while len(tracks) < n_tracks:
+        if draws >= max_draws:
+            raise RuntimeError(
+                f"{len(tracks)} of {n_tracks} tracks after {draws} draws: the prior rarely "
+                f"gives inspirals that last {T_ref / YRSID_SI:.3g} yr."
+            )
+        draws += 1
+        log10_m1, m2, a, e_f = rng.uniform(lo, hi)
+        try:
+            f = model((10**log10_m1, m2, a, T_ref / YRSID_SI, e_f)).f
+        except Exception:  # FEW cannot integrate this draw back to t_alpha[0]
+            continue
+        if f[0] == 0.0:  # the inspiral is shorter than the grid
+            continue
+        f[incomplete] = 0.0
+        tracks.append(f)
+        params.append((log10_m1, m2, a, e_f))
+    return np.array(tracks), np.array(params)
 
 
 def kerr_ecc_eq_inspiral():

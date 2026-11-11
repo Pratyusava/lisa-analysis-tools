@@ -43,5 +43,6 @@ from .tracks import (  # noqa: F401
     SVDTrackModel,
     Track,
     backward_inspiral,
+    few_track_bank,
     kerr_ecc_eq_inspiral,
 )

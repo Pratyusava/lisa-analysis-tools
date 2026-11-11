@@ -4,7 +4,10 @@ Run ``python build_emri_search_notebook.py`` after editing. When the notebook al
 exists, the outputs of every cell whose code is unchanged are carried over, so
 regenerating keeps the executed results and only the cells whose code changed need
 re-executing (they are listed). ``--fresh`` writes an unexecuted notebook instead.
-``N_INITIAL=.. N_POP=.. N_STEPS=..`` set the search-budget placeholders of Sec. 1f.
+``--run=2,4-18,30`` then executes those cells (indices as printed), in that order, in
+one fresh kernel of the notebook's kernelspec (``--kernel=python3``: another), and saves
+their outputs. ``N_INITIAL=.. N_POP=.. N_STEPS=..`` set the search-budget placeholders
+of Sec. 1f.
 """
 
 import nbformat as nbf
@@ -78,6 +81,7 @@ from lisatools.search.emri import (
     EMRISearch,
     ExcessPowerStatistic,
     FEWHarmonicTrackModel,
+    few_track_bank,
     FEWInjector,
     FresnelStatistic,
     MatchedFilterStatistic,
@@ -116,14 +120,12 @@ Units: seconds [s], years [yr] (1 yr $=$ `YRSID_SI` $= 3.15581\times10^{7}$ s), 
 |---|---|
 | `EMRI_SEARCH_DIR` | Lorenzo's EMRI-Search checkout (PSD table, SVD basis file) |
 | `PSD_FILE` | Two-column table $(f, S_n(f))$ of the TDI2 A/E PSD used by the paper |
-| `BASIS_FILE` | Lorenzo's SVD basis (`V_K`, `lb`, `ub`, ...) |
 | `RESULTS_DIR` | Where the run's results are saved |
 """)
 
 code(r"""
 EMRI_SEARCH_DIR = os.environ.get("EMRI_SEARCH_DIR", os.path.expanduser("~/Documents/Research/LISA/EMRI-Search"))
 PSD_FILE = os.path.join(EMRI_SEARCH_DIR, "src/emrisearch/data/TDI2_AE_psd.npy")
-BASIS_FILE = os.path.join(EMRI_SEARCH_DIR, "examples/new_svd_basis_Tsft50000.0_cut20.npz")
 RESULTS_DIR = "results_toy"
 # PAPER: RESULTS_DIR = "results_paper"
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -192,31 +194,42 @@ SOURCE = (M1, M2, SPIN, T_PL, E_F)
 md(r"""
 ### 1d. SVD track basis
 
-| Name | Symbol | Meaning |
-|---|---|---|
-| `BASIS_SOURCE` | | `"lorenzo"`: search with `BASIS_FILE`; `"build"`: search with the basis built in Sec. 5 |
-| `N_BANK` | $N$ | Training tracks drawn from the prior (paper: $10^4$; Lorenzo's file holds 46 371) |
-| `BANK_PRIOR` | | Uniform ranges of $(\log_{10} m_1, m_2, a, e_f)$; training tracks plunge at $T_{\rm ref} = 1$ yr |
-| `N_MODES` | $K$ | Retained singular vectors |
-| `BOX_QUANTILE` | $q$ | Coefficient box $[Q_q, Q_{1-q}]$ per mode (mode 0's upper edge: the maximum), as in Lorenzo's file |
-| `BANK_SEED` | | Seed of the training draws |
+Two ways to get the basis the search parametrises tracks with (Sec. 5):
 
-The toy searches with Lorenzo's basis: a few hundred training tracks give too narrow a box to reach the source (Sec. 5 shows the check).
+* `BASIS_SOURCE = "file"`: load `BASIS_FILE`, an `.npz` with `V_K`, `lb`, `ub` (and `S_K`): Lorenzo's basis, or one
+  saved by an earlier `"build"`.
+* `BASIS_SOURCE = "build"`: draw `N_BANK` FEW $m = 2$ tracks from `SOURCE_PRIOR`, all plunging at `T_REF`, take the SVD,
+  keep `N_MODES` modes and the coefficient box, and save the basis to `BASIS_SAVE`.
+
+| Input | Symbol | Meaning |
+|---|---|---|
+| `T_REF` | $T_{\rm ref}$ | Plunge time of the basis tracks, both options (Lorenzo's file: 1 yr); the basis grid is $t_\alpha = \alpha T_{\rm SFT} < T_{\rm ref}$ |
+| `N_BANK` | $N$ | Tracks in the bank (paper: $10^4$; Lorenzo's file holds 46 371) |
+| `SOURCE_PRIOR` | | Uniform ranges of $(\log_{10} m_1, m_2, a, e_f)$ (paper Table 1); also the source prior of the comparison, Sec. 10 |
+| `N_MODES` | $K$ | Retained singular vectors |
+| `BOX_QUANTILE` | $q$ | Coefficient box $[Q_q, Q_{1-q}]$ per mode |
+| `FIRST_MODE_MAX` | | Mode 1's upper edge is the bank's maximum instead of $Q_{1-q}$, as in Lorenzo's file |
+| `BANK_SEED` | | Seed of the draws |
+| `BASIS_SAVE` | | Where a built basis is saved (point `BASIS_FILE` at it to reuse it) |
 """)
 
 code(r"""
-BASIS_SOURCE = "lorenzo"     # PAPER / REPO: "lorenzo" (or "build" with N_BANK = 10_000 .. 46_371)
-N_BANK = 200                 # PAPER: 10_000;  Lorenzo's file: 46_371 tracks
-BANK_PRIOR = {               # PAPER (Table 1)
+BASIS_SOURCE = "file"        # "file": BASIS_FILE;  "build": the SVD of a FEW track bank with the inputs below
+BASIS_FILE = os.path.join(EMRI_SEARCH_DIR, "examples/new_svd_basis_Tsft50000.0_cut20.npz")   # Lorenzo's basis
+T_REF = YRSID_SI             # the basis tracks plunge at T_REF (Lorenzo's file: 1 yr)
+# "build" inputs
+N_BANK = 1_000               # PAPER: 10_000 (~0.25 s per track on a laptop);  Lorenzo's file: 46_371 tracks
+SOURCE_PRIOR = {             # PAPER (Table 1); also the source prior of the comparison (Sec. 10)
     "log10_m1": (np.log10(5e5), np.log10(5e6)),
     "m2": (1.0, 100.0),
     "a": (0.0, 0.998),
     "e_f": (0.0, 0.1),
 }
 N_MODES = 20                 # PAPER / REPO: 20
-BOX_QUANTILE = 0.015         # REPO (exact match to lb / ub in BASIS_FILE); paper text: "symmetric 3 sigma"
+BOX_QUANTILE = 0.015         # REPO (matches lb / ub in Lorenzo's file); paper text: "symmetric 3 sigma"
+FIRST_MODE_MAX = True        # REPO: mode 1's upper edge is the maximum of the bank
 BANK_SEED = 2601
-T_REF = YRSID_SI             # basis tracks plunge at 1 yr
+BASIS_SAVE = os.path.join(RESULTS_DIR, f"svd_basis_{N_BANK}x{N_MODES}.npz")
 """)
 
 md(r"""
@@ -314,7 +327,7 @@ optimiser seeds, same budget), and its detections are thresholded on its **own**
 | `COMPARE_BUDGETS` | Per preset, the search inputs of Sec. 1f it replaces: `"paper_budget"` repeats the sources, noise and optimiser seeds of the `"medium"` preset at SNR 20 with the paper's population and iterations, and redoes the noise background at that budget |
 | `COMPARE_STATISTICS` | Statistics compared (`"fresnel"`, `"H"`) |
 | `COMPARE_SNRS` | Injected SNRs (over `T_SNR`); each source is injected at every SNR with the same noise |
-| `COMPARE_N_SOURCES` | Sources drawn from the Table 1 priors (`BANK_PRIOR`), each plunging at the end of a random duration of the grid |
+| `COMPARE_N_SOURCES` | Sources drawn from the Table 1 priors (`SOURCE_PRIOR`), each plunging at the end of a random duration of the grid |
 | `COMPARE_N_SEEDS` | Optimiser seeds per injection (restarts; also reported as best-of-seeds) |
 | `COMPARE_N_NOISE` | Noise-only data sets searched per statistic for its background |
 | `COMPARE_SEED` | Seed of the source draws, angles and noise |
@@ -593,70 +606,62 @@ plt.legend(); plt.tight_layout()
 md(r"""
 ## 5. SVD basis of frequency tracks
 
-A bank of $N$ FEW $m = 2$ tracks $f_{i,\alpha} = f(t_\alpha;\theta_i)$, all plunging at $T_{\rm ref} = 1$ yr, on the 1-yr segment grid
-$t_\alpha = \alpha T_{\rm SFT}$, $\alpha = 0, \dots, 631$ (the 632nd sample starts a partial segment past the 631 full ones and is set to zero),
-is decomposed and truncated (paper Eqs. 9–10):
+A bank of $N$ FEW $m = 2$ tracks $f_{i,\alpha} = f(t_\alpha;\theta_i)$, all plunging at $T_{\rm ref}$, on the segment grid
+$t_\alpha = \alpha T_{\rm SFT} < T_{\rm ref}$ (632 samples for 1 yr; the segment that does not complete before the plunge is
+set to zero), is decomposed and truncated (paper Eqs. 9–10):
 
 $$
 f_{i,\alpha} = \sum_{p} U_{ip}\, S_p\, V_{p\alpha} \;\approx\; \sum_{p=1}^{K} W_{ip}\, V_{p\alpha}, \qquad W_{ip} = U_{ip} S_p .
 $$
 
 A search track is any $f_\alpha(c) = \sum_p c_p V_{p\alpha}$ with coefficients in the box $c_p \in [\ell_p, u_p]$,
-$\ell_p = Q_{q}(W_{\cdot p})$, $u_p = Q_{1-q}(W_{\cdot p})$ ($u_1 = \max_i W_{i1}$), parametrised by the unit cube
-$\xi \in [0,1]^K$: $c_p = \ell_p + \xi_p (u_p - \ell_p)$.
+$\ell_p = Q_{q}(W_{\cdot p})$, $u_p = Q_{1-q}(W_{\cdot p})$ ($u_1 = \max_i W_{i1}$ with `FIRST_MODE_MAX`), parametrised by the
+unit cube $\xi \in [0,1]^K$: $c_p = \ell_p + \xi_p (u_p - \ell_p)$.
 
-The cell builds a small bank (`N_BANK`) with the paper's priors, then checks two things against Lorenzo's file:
-that his 20 modes span the new tracks, and whether each basis's box contains the injected source.
+`"file"` loads such a basis; `"build"` computes it (`few_track_bank` + `SVDBasis.build`) and saves it. The checks below
+hold for either: the singular-value spectrum, the range of starting frequencies the box reaches, and where the injected
+source sits in the box (its track plunging at $T_{\rm ref}$, projected on the modes: a $\xi_p$ outside $[0, 1]$ means the
+search cannot represent it exactly).
 """)
 
 code(r"""
-t_basis = np.arange(0.0, YRSID_SI, T_SFT)              # 632 samples, as V_K
-bank_model = FEWHarmonicTrackModel(t_basis, m=2, n=0)
-rng_bank = np.random.default_rng(BANK_SEED)
-lo = np.array([BANK_PRIOR[k][0] for k in ("log10_m1", "m2", "a", "e_f")])
-hi = np.array([BANK_PRIOR[k][1] for k in ("log10_m1", "m2", "a", "e_f")])
-bank = []
-for log10_m1, m2, a, e_f in rng_bank.uniform(lo, hi, size=(N_BANK, 4)):
-    try:
-        f = bank_model((10**log10_m1, m2, a, T_REF / YRSID_SI, e_f)).f
-    except Exception:          # FEW cannot integrate back a full year for this draw
-        continue
-    if f[0] != 0.0:            # keep tracks that span the whole year
-        f[-1] = 0.0            # partial 632nd segment
-        bank.append(f)
-bank = np.array(bank)
-print(elapsed(), f"bank: {len(bank)} of {N_BANK} draws kept")
+t_basis = np.arange(0.0, T_REF, T_SFT)                        # the basis grid (632 samples for T_REF = 1 yr)
+if BASIS_SOURCE == "file":
+    basis = SVDBasis.from_npz(BASIS_FILE)
+    print(f"basis from {BASIS_FILE}")
+elif BASIS_SOURCE == "build":
+    bank, bank_params = few_track_bank(SOURCE_PRIOR, N_BANK, t_basis, T_REF, seed=BANK_SEED)
+    basis = SVDBasis.build(bank, N_MODES, box_quantile=BOX_QUANTILE, first_mode_max=FIRST_MODE_MAX)
+    basis.save_npz(BASIS_SAVE)
+    print(f"{elapsed()} basis built from {len(bank)} tracks and saved to {BASIS_SAVE}")
+else:
+    raise ValueError(f"BASIS_SOURCE must be 'file' or 'build', not {BASIS_SOURCE!r}")
+if basis.n_samples != t_basis.size:
+    raise ValueError(f"the basis has {basis.n_samples} samples but T_REF / T_SFT give {t_basis.size}")
+f_lo, f_hi = basis.frequency_range()
+print(f"{basis.n_modes} modes x {basis.n_samples} samples; the box's tracks start between {f_lo * 1e3:.2f} and "
+      f"{f_hi * 1e3:.2f} mHz (negative starts are dropped from the initial population)")
 
-U, S_vals, Vt = np.linalg.svd(bank, full_matrices=False)
-W = U[:, :N_MODES] * S_vals[:N_MODES]
-lb, ub = np.quantile(W, BOX_QUANTILE, axis=0), np.quantile(W, 1 - BOX_QUANTILE, axis=0)
-ub[0] = W[:, 0].max()
-built_basis = SVDBasis(Vt[:N_MODES], lb, ub, S=S_vals[:N_MODES])
-lorenzo_basis = SVDBasis.from_npz(BASIS_FILE)
-
-
-def projection_error(tracks, basis):
-    rec = (tracks @ basis.V.T) @ basis.V
-    return np.linalg.norm(tracks - rec, axis=1) / np.linalg.norm(tracks, axis=1)
-
-
-print(f"new tracks on Lorenzo's {lorenzo_basis.n_modes} modes: median rel. error {np.median(projection_error(bank, lorenzo_basis)):.1e}")
-f_src = bank_model((M1, M2, SPIN, 1.0, E_F)).f
-f_src[-1] = 0.0                                      # the source as a 1-yr basis track
-for name, b in (("built", built_basis), ("Lorenzo", lorenzo_basis)):
-    xi = (f_src @ b.V.T - b.lb) / (b.ub - b.lb)
-    print(f"{name:8s} basis: source xi in [{xi.min():.2f}, {xi.max():.2f}]; modes outside the box: {list(np.where((xi < 0) | (xi > 1))[0])}")
-
-basis = lorenzo_basis if BASIS_SOURCE == "lorenzo" else built_basis
+# The injected source in this basis: its track plunging at T_REF, projected on the modes.
+f_src = FEWHarmonicTrackModel(t_basis, m=2, n=0)((M1, M2, SPIN, T_REF / YRSID_SI, E_F)).f
+f_src[t_basis + T_SFT > T_REF] = 0.0                            # the segment that does not complete before the plunge
+c_src = basis.V @ f_src
+xi_src = (c_src - basis.lb) / (basis.ub - basis.lb)
+outside = np.flatnonzero((xi_src < 0) | (xi_src > 1))
+rel_err = np.linalg.norm(f_src - c_src @ basis.V) / np.linalg.norm(f_src)
+print(f"injected source: xi in [{xi_src.min():.2f}, {xi_src.max():.2f}], modes outside the box: {outside.tolist()}; "
+      f"projection error {rel_err:.1e}")
 
 fig, ax = plt.subplots(1, 2, figsize=(11, 3.5))
-ax[0].semilogy(S_vals[:40] / S_vals[0], "o-", label="built bank")
-if lorenzo_basis.S is not None:
-    ax[0].semilogy(lorenzo_basis.S / lorenzo_basis.S[0], "s", mfc="none", label="Lorenzo's file")
-ax[0].set_xlabel("mode p"); ax[0].set_ylabel(r"$S_p / S_1$"); ax[0].legend()
-for i in np.linspace(0, len(bank) - 1, 15, dtype=int):
-    ax[1].plot(t_basis / YRSID_SI, bank[i] * 1e3, lw=0.8)
-ax[1].set_xlabel("t [yr]"); ax[1].set_ylabel("f [mHz]"); ax[1].set_title("training tracks (plunge at 1 yr)")
+if basis.S is not None:
+    ax[0].semilogy(np.arange(1, basis.n_modes + 1), basis.S / basis.S[0], "o-")
+ax[0].set_xlabel("mode p"); ax[0].set_ylabel(r"$S_p / S_1$"); ax[0].set_title("singular values")
+if BASIS_SOURCE == "build":
+    for i in np.linspace(0, len(bank) - 1, 15, dtype=int):
+        ax[1].plot(t_basis / YRSID_SI, bank[i] * 1e3, color="grey", lw=0.5, alpha=0.5)
+ax[1].plot(t_basis / YRSID_SI, f_src * 1e3, "k", lw=3, alpha=0.3, label=r"source track, plunge at $T_{\rm ref}$")
+ax[1].plot(t_basis / YRSID_SI, (c_src @ basis.V) * 1e3, "C1", lw=1, label=f"its projection on {basis.n_modes} modes")
+ax[1].set_xlabel("t [yr]"); ax[1].set_ylabel("f [mHz]"); ax[1].legend()
 plt.tight_layout()
 """)
 
@@ -918,8 +923,8 @@ def draw_sources(n, seed):
     # Table 1 sources, each plunging at the end of a random duration of the grid, starting inside F0_RANGE.
     # Returns the parameters and each source's plunge duration [segments].
     rng = np.random.default_rng(seed)
-    lo_p = np.array([BANK_PRIOR[k][0] for k in ("log10_m1", "m2", "a", "e_f")])
-    hi_p = np.array([BANK_PRIOR[k][1] for k in ("log10_m1", "m2", "a", "e_f")])
+    lo_p = np.array([SOURCE_PRIOR[k][0] for k in ("log10_m1", "m2", "a", "e_f")])
+    hi_p = np.array([SOURCE_PRIOR[k][1] for k in ("log10_m1", "m2", "a", "e_f")])
     sources, plunges = [], []
     while len(sources) < n:
         log10_m1, m2, a, e_f = rng.uniform(lo_p, hi_p)
@@ -1190,6 +1195,35 @@ nb.metadata["kernelspec"] = {"name": "lat-emri", "display_name": "Python (lat-em
 OUT = "emri_search_lorenzo.ipynb"
 
 
+def parse_cells(spec):
+    """``"2,4-18,30"`` -> ``[2, 4, 5, ..., 18, 30]``."""
+    cells = []
+    for part in spec.split(","):
+        a, _, b = part.partition("-")
+        cells.extend(range(int(a), int(b or a) + 1))
+    return cells
+
+
+def execute_cells(nb, indices, kernel_name=None):
+    """Execute the code cells ``indices`` of ``nb``, in that order, in one fresh kernel
+    (the notebook's own kernelspec unless ``kernel_name``), storing their outputs;
+    the cells not listed keep theirs."""
+    import os
+
+    from nbclient import NotebookClient
+
+    client = NotebookClient(nb, timeout=-1, kernel_name=kernel_name or "",
+                            resources={"metadata": {"path": os.getcwd()}})
+    with client.setup_kernel():
+        client.reset_execution_trackers()
+        for i in indices:
+            cell = nb.cells[i]
+            if cell.cell_type != "code":
+                continue
+            print(f"running cell {i}: {cell.source.strip().splitlines()[0][:70]}", flush=True)
+            client.execute_cell(cell, i)
+
+
 def carry_outputs(new, old):
     """Give ``new``'s cells the ids and executed outputs of ``old``'s cells with the same source.
 
@@ -1222,14 +1256,17 @@ if __name__ == "__main__":
     import sys
 
     args = sys.argv[1:]
-    settings = dict(arg.split("=") for arg in args if arg != "--fresh")
+    options = {k: v for k, _, v in (a.partition("=") for a in args if a.startswith("--"))}
+    settings = dict(arg.split("=") for arg in args if not arg.startswith("--"))
     text = nbf.writes(nb)
     for key, default in (("N_INITIAL", "1024"), ("N_POP", "128"), ("N_STEPS", "300")):
         text = text.replace(f"__{key}__", settings.get(key, default))
     out = nbf.reads(text, as_version=4)
-    if os.path.exists(OUT) and "--fresh" not in args:
+    if os.path.exists(OUT) and "--fresh" not in options:
         dropped = carry_outputs(out, nbf.read(OUT, as_version=4))
         print(f"kept the outputs of {OUT}"
               + (f"; code cells without outputs, to re-execute: {dropped}" if dropped else ""))
+    if options.get("--run"):
+        execute_cells(out, parse_cells(options["--run"]), options.get("--kernel"))
     nbf.write(out, OUT)
     print("wrote", OUT)
