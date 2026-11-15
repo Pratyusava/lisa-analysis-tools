@@ -113,12 +113,6 @@ class SFTData:
         signal = td.stft(settings=settings, window=tukey(nperseg, window_alpha))
         return cls(signal, psd=psd, dt=dt, window_alpha=window_alpha)
 
-    def with_sfts(self, sfts) -> "SFTData":
-        """Same grid and PSD, different SFTs (e.g. a noise-only realisation)."""
-        return SFTData(
-            STFTSignal(np.asarray(sfts), self.signal.settings), self.psd, self.dt, self.window_alpha
-        )
-
 
 @dataclass
 class FDData:

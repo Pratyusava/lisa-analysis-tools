@@ -1,0 +1,94 @@
+# Every setting of a campaign, with its value from Speri et al. (arXiv:2510.20891: PAPER), their
+# repository (github.com/lorenzsp/EMRI-Search: REPO) or Cutler & Bustamante-Rosell's draft
+# (draft). These are the code's defaults (a test checks it), so a campaign file needs only the
+# tables it uses: S_svd.toml and H_chebyshev.toml list the settings of their statistic and basis
+# alone. Copy from here to change anything else.
+#
+# As it stands this file is Speri et al.'s search, the same as S_svd.toml:
+#
+#   python emri_search.py configs/reference.toml        # search, background, collect
+#
+# Only `out` is required (and `basis.file` for a basis loaded from a file). Paths may use
+# $VARIABLES and ~ and are relative to this file. `none` switches off an optional setting.
+# Of [statistic.*] and [basis.*] only the chosen one's table is read (and [basis.bank] only for
+# a build); the others do not change a campaign's results or its fingerprint.
+
+out = "../runs/S_svd"     # campaign directory: config.json, results/, summary.csv
+n_workers = 4             # processes
+tol_bins = 2.0            # localisation tolerance of the summary [bins]
+p_fa = [0.5, 1e-2, 1e-4]  # PAPER: false-alarm probabilities of the detection thresholds
+
+[inputs]
+injections = ["../inj/*.json"]  # injection files (make_injections.py), each on the noise it records
+noise = ["../noise/*.json"]      # PAPER: 100 noise files (make_noise.py), the background (FAR >= 1/n)
+data = []                        # data files searched as is (.npz: signal (n_channels, N), dt)
+
+[data]
+dt = 5.0                  # PAPER: cadence [s]
+T_sft = 5e4               # PAPER: segment duration [s]
+window_alpha = 0.2        # REPO: Tukey parameter of each segment's window
+channels = "A"            # PAPER: TDI channels ("AE" for both)
+psd_file = "$EMRI_SEARCH_DIR/src/emrisearch/data/TDI2_AE_psd.npy"   # REPO; none: LAT's analytic TDI2 PSD
+
+[statistic]
+name = "fresnel"          # "fresnel": Speri et al.'s S;  "H": Cutler & Bustamante-Rosell's excess power
+
+[statistic.fresnel]
+P = 100                   # PAPER: half-width of the bin window (2P + 1 bins per segment)
+f_min = 3.1622776601683794e-4   # PAPER: 10^-3.5 Hz; segments with f <= f_min do not count
+fdot_min = 1e-13          # PAPER: ... nor fdot <= fdot_min [Hz/s]
+dphi_max = 1.0            # PAPER: ... nor |fddot| T_sft^3 / 6 >= dphi_max
+
+[statistic.H]             # used when name = "H" (Cutler & Bustamante-Rosell's draft)
+band = [3e-4, 2e-2]       # band of the coherent FFT [Hz]; must hold the tracks
+windows = [2e3, 4.2e3, 1.72e4, 6.9e4]   # draft: 10, 21, 86, 345 delay cells of ~200 s
+delay_step = 200.0        # draft: delay-grid spacing [s]
+normalization = "exact"   # "exact" per template;  draft: "asymptotic" (R = L / K)
+window_alpha = 0.01       # Tukey taper of the stream before its FFT (0: a transient at delay 0)
+spans = [2.5e-3, 5e-3, 1e-2]   # template widths the population is bucketed by [Hz]; none: whole band
+
+[basis]
+name = "svd"              # "svd": Speri et al.'s SVD basis of FEW tracks;  "chebyshev": Cutler & Bustamante-Rosell
+source = "file"           # "file": load `file`;  "build": from the FEW bank below, saved to `file`
+file = "$EMRI_SEARCH_DIR/examples/new_svd_basis_Tsft50000.0_cut20.npz"   # REPO (default for a build: <out>/basis.npz)
+T_ref = 31558149.763545595   # plunge time of the basis tracks [s] (REPO's file: 1 yr); the Chebyshev anchor time
+
+[basis.svd]
+f0_range = [5e-4, 1e-2]   # PAPER: starting frequencies of the initial search tracks [Hz] (REPO QuickStart: 1e-3, 5e-3)
+n_modes = 20              # PAPER / REPO: modes kept by a build
+box_quantile = 0.015      # REPO: a build's box [Q_q, Q_1-q] per mode (reproduces REPO's file)
+first_mode_max = true     # REPO: mode 1's upper edge is the bank's maximum
+
+[basis.chebyshev]         # used when name = "chebyshev"
+y_range = [-1.0, 1.0]     # anchor coordinate: the track's y at the end of the stream, anywhere in the band
+band = [3e-3, 8e-3]       # draft: 3-8 mHz; tracks are zero outside it
+n_coeffs = 5              # draft: 5
+margin = 0.2              # draft: a build widens the fitted range by 20 % at each end
+min_span = 1.9            # draft: a bank track enters the box when its fit covers 1.9 of the band's width 2
+box_scale = 1.0           # draft: 1 (catalogue box) or 10 (wide box)
+
+[basis.bank]              # the FEW m = 2 tracks a build draws (source = "build")
+n_tracks = 10_000         # PAPER: 10^4 (~0.25 s per track); REPO's file: 46 371
+seed = 2601               # REPO
+
+[basis.bank.prior]        # PAPER Table 1, uniform
+log10_m1 = [5.698970004336019, 6.698970004336019]   # m1 in [5e5, 5e6] Msun
+m2 = [1.0, 100.0]
+a = [0.0, 0.998]
+e_f = [0.0, 0.1]
+
+[durations]
+T_min = 0.1               # PAPER: shortest analysed stream [yr]
+step = 12                 # PAPER: increment of the stream length [segments] (~7 d; 48 durations in 1 yr)
+
+[optimizer]
+n_initial = 1024          # PAPER: initial draws screened by the statistic (REPO QuickStart: 128)
+n_population = 512        # PAPER: best draws kept and optimised (REPO QuickStart: 64)
+n_steps = 525             # PAPER: Adam + DE iterations (REPO QuickStart: 200)
+patience = "none"         # PAPER: always n_steps;  e.g. 50: stop after 50 iterations without gain
+min_improvement = 1e-3    # relative gain that resets the patience
+learning_rate = 1e-5      # PAPER / REPO: Adam step size in unit-cube coordinates
+F_range = [0.3, 1.5]      # PAPER / REPO: DE differential weight
+p_elitism = 0.5           # REPO: probability that the DE base vector is the fittest member
+batch_size = "none"       # members evaluated at a time (memory only); 64 GB: none for S, 32 for H
+seed = 0                  # initial draws and DE (duration k adds k)

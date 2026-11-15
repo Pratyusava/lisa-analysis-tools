@@ -45,6 +45,7 @@ from lisatools.search.emri import (
     gaussian_noise,
     tukey_chirp_kernel,
 )
+from lisatools.search.emri.injection import ANGLE_NAMES
 from lisatools.search.emri.optimize import BucketedLoss, de_settings, population_evaluator
 from lisatools.search.emri.parallel import SearchTask, run_tasks
 from lisatools.utils.constants import YRSID_SI
@@ -1574,6 +1575,440 @@ class InjectionTest(unittest.TestCase):
         for got, want in ((signal.sfts[0], ref["signal_sfts"]), (data.sfts[0], ref["data_sfts"])):
             atol = 1e-9 * np.abs(want).max()
             np.testing.assert_allclose(got, want.T, rtol=1e-9, atol=atol)
+
+
+def store_by_n(records, label, n_seg=None):
+    """``[(n_seg, record)]`` of a stream's saved results, or one record's statistic."""
+    recs = [(int(r["n_seg"]), r) for r in records if r["label"] == label]
+    if n_seg is None:
+        return recs
+    return next(r["best_statistic"] for n, r in recs if n == n_seg)
+
+
+CAMPAIGN_TOML = """
+out = "campaign"
+n_workers = 1
+
+[inputs]
+injections = ["inj_*.json"]
+noise = ["noise_*.json"]
+
+[data]
+dt = {dt!r}
+T_sft = {T_sft!r}
+
+[basis]
+file = "basis.npz"
+T_ref = {T_ref!r}
+
+[basis.svd]
+f0_range = [2e-3, 4e-3]
+
+[durations]
+T_min = {T_min!r}
+step = 12
+
+[optimizer]
+n_initial = 16
+n_population = 8
+n_steps = 3
+"""
+
+
+class CampaignTest(unittest.TestCase):
+    """The campaign file, SearchConfig, injection files, the result store and a campaign."""
+
+    def setUp(self):
+        import tempfile
+
+        from lisatools.search.emri import EMRIInjection, RunConfig
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        toy_basis(n_samples=N_SEG).save_npz(os.path.join(self.dir, "basis.npz"))
+        self.T_data = (N_SEG * T_SFT + DT) / YRSID_SI  # a stream of exactly N_SEG segments
+        self.toml = os.path.join(self.dir, "campaign.toml")
+        with open(self.toml, "w") as fh:
+            fh.write(
+                CAMPAIGN_TOML.format(
+                    dt=DT,
+                    T_sft=T_SFT,
+                    T_ref=N_SEG * T_SFT,
+                    T_min=12 * T_SFT / YRSID_SI,
+                )
+            )
+        self.run = RunConfig.from_toml(self.toml)
+        self.config = self.run.search
+        self.psd = self.config.psd()
+        self.track = chirp_track(f0=3e-3, fdot=2.5e-11)
+        amp = 40 * np.sqrt(self.psd(np.array([3e-3]))[0] / (N_SEG * T_SFT / 2))
+        self.params = dict(m1=1e6, m2=10.0, a=0.5, T_pl=0.1, e_f=0.1, x_f=1.0, p0=10.0, e0=0.1)
+        self.params.update(x0=1.0, dist=2.0, **{name: 0.0 for name in ANGLE_NAMES})
+        self.injection = EMRIInjection(
+            chirp_timeseries(self.track, amp)[None, :], DT, self.params, 40.0, "A", self.psd
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def fake_few(self, scale=1.0):
+        """FEW's waveform replaced by the toy chirp, scaled as 1 / dist."""
+        from unittest import mock
+
+        from lisatools.search.emri import FEWInjector
+
+        signal = self.injection.signal * self.params["dist"] * scale
+
+        def waveform(injector, m1, m2, a, p0, e0, x0, dist, angles):
+            return signal / dist
+
+        return mock.patch.object(FEWInjector, "waveform", waveform)
+
+    def write_injection(self, label="inj_000", noise_seed=1000):
+        from lisatools.search.emri import FEWInjector, InjectionFile
+
+        injector = FEWInjector(self.T_data, dt=DT, channels="A")
+        recipe = InjectionFile.make(self.config, self.injection, injector, label, noise_seed)
+        path = os.path.join(self.dir, label + ".json")
+        recipe.save(path)
+        return path
+
+    def write_noise(self, label="noise_0000", seed=100_000):
+        from lisatools.search.emri import NoiseFile
+
+        path = os.path.join(self.dir, label + ".json")
+        NoiseFile.make(self.config, label, seed, self.T_data).save(path)
+        return path
+
+    def test_noise_file(self):
+        from lisatools.search.emri import NoiseFile, RecipeMismatch, gaussian_noise
+
+        path = self.write_noise()
+        self.assertLess(os.path.getsize(path), 20_000)  # a recipe, not 240k samples
+        recipe = NoiseFile.load(path)
+        n = self.config.n_samples(self.T_data)
+        self.assertEqual((recipe.seed, recipe.n_samples, recipe.channels), (100_000, n, "A"))
+        want = gaussian_noise(recipe.n_samples, DT, self.psd, 1, np.random.default_rng(100_000))
+        np.testing.assert_array_equal(recipe.generate(self.config), want)
+        # a regeneration that differs is refused, and so is another configuration
+        recipe.checksum["power"][0] *= 1 + 1e-6
+        with self.assertRaises(RecipeMismatch):
+            recipe.generate(self.config)
+        recipe = NoiseFile.load(path)
+        for change in ({"data.dt": 2.5}, {"data.channels": "AE"}):
+            with self.assertRaises(RecipeMismatch, msg=change):
+                recipe.generate(self.config.replace(**change))
+        psd_file = os.path.join(self.dir, "psd.npy")
+        f = np.logspace(-5, 0, 50)
+        np.save(psd_file, np.stack([f, self.psd(f)], axis=1))
+        with self.assertRaises(RecipeMismatch):  # another PSD
+            recipe.generate(self.config.replace(**{"data.psd_file": psd_file}))
+
+    def test_injection_file(self):
+        from lisatools.search.emri import InjectionFile, RecipeMismatch, gaussian_noise
+
+        path = self.write_injection(noise_seed=1234)
+        self.assertLess(os.path.getsize(path), 40_000)
+        recipe = InjectionFile.load(path)
+        n = self.injection.signal.shape[1]
+        self.assertEqual((recipe.snr, recipe.noise_seed, recipe.n_samples), (40.0, 1234, n))
+        self.assertEqual(recipe.params, self.params)
+        with self.fake_few():
+            inj = recipe.injection(self.config, path)
+        np.testing.assert_allclose(inj.signal, self.injection.signal, rtol=1e-15)
+        want = gaussian_noise(recipe.n_samples, DT, self.psd, 1, np.random.default_rng(1234))
+        np.testing.assert_array_equal(inj.noise, want)
+        self.assertEqual((inj.snr, inj.params), (40.0, self.params))
+        with self.fake_few(scale=1 + 1e-6), self.assertRaises(RecipeMismatch):
+            recipe.injection(self.config, path)  # FEW gives another signal now
+
+    def test_campaign_file(self):
+        from lisatools.search.emri import RunConfig
+
+        run = self.run
+        self.assertEqual(run.out, os.path.join(self.dir, "campaign"))  # relative to the file
+        self.assertEqual(run.inputs.injections, [os.path.join(self.dir, "inj_*.json")])
+        self.assertEqual(run.inputs.noise, [os.path.join(self.dir, "noise_*.json")])
+        self.assertEqual(self.config.basis.file, os.path.join(self.dir, "basis.npz"))
+        self.assertEqual((self.config.statistic.name, self.config.basis.name), ("fresnel", "svd"))
+        self.assertEqual(self.config.basis.svd.f0_range, (2e-3, 4e-3))  # TOML list -> tuple
+        self.assertEqual(self.config.statistic.fresnel.P, 100)  # omitted -> default
+        self.assertEqual(self.config.durations_of(N_SEG), [12, 24])
+        # overrides: dotted keys, TOML values, bare words as strings, "none"
+        run = RunConfig.from_toml(
+            self.toml,
+            ["statistic.name=H", "statistic.H.spans=none", "optimizer.n_steps=7", "n_workers=3"],
+        )
+        self.assertEqual(run.search.statistic.name, "H")
+        self.assertIsNone(run.search.statistic.H.spans)
+        self.assertEqual((run.search.optimizer.n_steps, run.n_workers), (7, 3))
+        # to_dict has the file's layout and reads back as the same campaign
+        self.assertEqual(RunConfig.from_dict(run.to_dict()), run)
+        # a built basis defaults to <out>/basis.npz
+        run = RunConfig.from_toml(self.toml, ["basis.source=build", "basis.file="])
+        self.assertEqual(run.search.basis.file, os.path.join(run.out, "basis.npz"))
+        for bad in (
+            ["statistic.name=S"],  # not a statistic
+            ["basis.svd.n_mode=3"],  # unknown key
+            ["optimizer.n_steps=2.5"],  # not an integer
+            ["basis.svd.f0_range=[1e-3]"],  # wrong length
+            ["out="],  # no campaign directory
+            ["basis.file="],  # a file basis without a file
+        ):
+            with self.assertRaises(ValueError, msg=bad):
+                RunConfig.from_toml(self.toml, bad)
+        with self.assertRaises(FileNotFoundError):
+            run.injection_paths()  # nothing matches inj_*.npz yet
+
+    def test_reference_files(self):
+        # reference.toml lists every setting at its default (Speri et al.'s values); the run
+        # configs list only the tables of their own statistic and basis
+        import tomllib
+        from unittest import mock
+
+        from lisatools.search.emri import RunConfig, SearchConfig
+
+        configs = os.path.join(os.path.dirname(__file__), "..", "scripts", "emri_search", "configs")
+        basis_file = os.path.join(self.dir, "examples", "new_svd_basis_Tsft50000.0_cut20.npz")
+        os.makedirs(os.path.dirname(basis_file))
+        toy_basis().save_npz(basis_file)
+        loaded, tables = {}, {}
+        with mock.patch.dict(os.environ, {"EMRI_SEARCH_DIR": self.dir}):
+            for name in ("reference", "S_svd", "H_chebyshev"):
+                path = os.path.join(configs, name + ".toml")
+                loaded[name] = RunConfig.from_toml(path).search
+                with open(path, "rb") as fh:
+                    tables[name] = tomllib.load(fh)
+        got, want = loaded["reference"].to_dict(), SearchConfig().to_dict()
+        got["data"]["psd_file"] = got["basis"]["file"] = None
+        want["data"]["psd_file"] = want["basis"]["file"] = None
+        self.assertEqual(got, want)
+        self.assertEqual(loaded["S_svd"], loaded["reference"])  # the same search, fewer tables
+        self.assertEqual(loaded["S_svd"].fingerprint(), loaded["reference"].fingerprint())
+        for name, statistic, basis in (
+            ("S_svd", "fresnel", "svd"),
+            ("H_chebyshev", "H", "chebyshev"),
+        ):
+            config, t = loaded[name], tables[name]
+            self.assertEqual((config.statistic.name, config.basis.name), (statistic, basis))
+            self.assertEqual(set(t["statistic"]) - {"name"}, {statistic}, name)
+            extra = {"bank"} if config.basis.source == "build" else set()
+            self.assertEqual(
+                set(k for k, v in t["basis"].items() if isinstance(v, dict)), {basis} | extra, name
+            )
+        h = loaded["H_chebyshev"].to_dict()
+        ref = loaded["reference"].to_dict()
+        for d in (h, ref):
+            d["basis"]["file"] = None
+        self.assertEqual(h["basis"]["source"], "build")
+        h["statistic"]["name"], h["basis"]["name"], h["basis"]["source"] = "fresnel", "svd", "file"
+        h["optimizer"]["batch_size"] = None
+        self.assertEqual(h, ref)  # only the statistic, the basis and the memory batching differ
+
+    def test_config_round_trip_and_fingerprint(self):
+        from lisatools.search.emri import SearchConfig
+
+        config = self.config
+        path = os.path.join(self.dir, "config.json")
+        config.save_json(path)
+        back = SearchConfig.load_json(path)
+        self.assertEqual(back, config)
+        self.assertEqual(back.fingerprint(), config.fingerprint())
+        self.assertIsInstance(pickle.loads(pickle.dumps(config)), SearchConfig)
+        fp = config.fingerprint()
+        same = {  # the unused statistic's / basis's settings, memory-only batching
+            "statistic.H.delay_step": 100.0,
+            "basis.chebyshev.box_scale": 10.0,
+            "basis.bank.n_tracks": 5,
+            "optimizer.batch_size": 4,
+        }
+        for key, value in same.items():
+            self.assertEqual(config.replace(**{key: value}).fingerprint(), fp, key)
+        other = {
+            "statistic.name": "H",
+            "statistic.fresnel.P": 50,
+            "basis.svd.f0_range": (1e-3, 4e-3),
+            "optimizer.n_steps": 4,
+        }
+        for key, value in other.items():
+            self.assertNotEqual(config.replace(**{key: value}).fingerprint(), fp, key)
+        h = config.replace(**{"statistic.name": "H"})
+        self.assertNotEqual(
+            h.replace(**{"statistic.H.delay_step": 100.0}).fingerprint(), h.fingerprint()
+        )
+        toy_basis(n_samples=N_SEG, seed=1).save_npz(config.basis.file)  # a loaded basis by content
+        self.assertNotEqual(config.fingerprint(), fp)
+        with self.assertRaises(ValueError):
+            SearchConfig.from_dict({"optimizer": {"n_step": 3}})
+
+    def test_every_statistic_with_every_basis(self):
+        if not HAVE_JAX:
+            raise unittest.SkipTest("JAX not installed")
+        from lisatools.search.emri import ChebyshevBasis, Stream, StreamInfo
+
+        cheb = os.path.join(self.dir, "cheb.npz")
+        lb, ub = np.array([8.0, -0.5, -0.3, -0.2, -0.1]), np.array([11.0, 0.5, 0.3, 0.2, 0.1])
+        ChebyshevBasis(lb, ub).save_npz(cheb)
+        inj = self.injection.with_noise(rng=np.random.default_rng(0))
+        stream = Stream(StreamInfo("inj"), inj.signal.shape[1], DT, lambda: inj)
+        for statistic in ("fresnel", "H"):
+            for basis, path in (("svd", self.config.basis.file), ("chebyshev", cheb)):
+                config = self.config.replace(
+                    **{
+                        "statistic.name": statistic,
+                        "basis.name": basis,
+                        "basis.file": path,
+                        "optimizer.n_steps": 1,
+                    }
+                )
+                result = config.build_search(stream, 12).run(T_pl=12 * T_SFT, seed=0)
+                self.assertTrue(np.isfinite(result.best_statistic), (statistic, basis))
+                self.assertEqual(np.asarray(result.best_track.f).shape, (12,))
+
+    def test_build_basis(self):
+        # source = "build": built once from the bank (FEW replaced by toy chirps), then reused
+        from unittest import mock
+
+        from lisatools.search.emri import RunConfig, SVDBasis, TrackBank
+
+        t = np.arange(N_SEG) * T_SFT
+        rng = np.random.default_rng(0)
+        f = rng.uniform(2e-3, 4e-3, (50, 1)) + rng.uniform(1e-11, 4e-11, (50, 1)) * t
+        bank = TrackBank(f, np.gradient(f, t, axis=1), np.zeros((50, 4)))
+        run = RunConfig.from_toml(
+            self.toml, ["basis.source=build", "basis.file=", "basis.svd.n_modes=2"]
+        )
+        config = run.search
+        with mock.patch("lisatools.search.emri.config.few_track_bank", return_value=bank) as m:
+            config.prepare_basis(log=lambda *a: None)
+            config.prepare_basis(log=lambda *a: None)  # the file exists: not rebuilt
+        self.assertEqual(m.call_count, 1)
+        self.assertEqual(m.call_args.args[1], config.basis.bank.n_tracks)
+        basis = SVDBasis.from_npz(config.basis.file)
+        self.assertEqual((basis.n_modes, basis.n_samples), (2, N_SEG))
+        with self.assertRaises(FileNotFoundError):  # a file basis that is not there
+            RunConfig.from_toml(self.toml, ["basis.file=missing.npz"]).search.prepare_basis()
+
+    def test_data_stream(self):
+        from lisatools.search.emri import SFTData, data_stream
+
+        path = os.path.join(self.dir, "data.npz")
+        np.savez(path, signal=self.injection.signal, dt=DT)
+        stream = data_stream(self.config, path)
+        self.assertEqual((stream.label, stream.info.kind, stream.noise), ("data", "data", False))
+        data = stream.sft_data(self.config, 12)
+        want = SFTData.from_timeseries(
+            self.injection.signal, DT, T_SFT, self.psd, n_segments=12, window_alpha=0.2
+        )
+        np.testing.assert_allclose(data.sfts, want.sfts)
+
+    def test_background_standardises_each_duration(self):
+        # Speri et al.: Z_k = (X_k - mu_k) / sigma_k per duration, Lambda = max_k Z_k
+        from lisatools.search.emri import Background
+
+        rng = np.random.default_rng(0)
+        X = rng.normal([[10.0, 20.0, 40.0]], [[1.0, 2.0, 4.0]], size=(50, 3))
+        bg = Background(
+            {f"n{i:02d}": {12: x[0], 24: x[1], 36: x[2], 48: 0.0} for i, x in enumerate(X)}
+        )
+        self.assertEqual(bg.durations, [12, 24, 36, 48])
+        np.testing.assert_allclose(bg.mu[:3], X.mean(axis=0))
+        np.testing.assert_allclose(bg.sigma[:3], X.std(axis=0, ddof=1))
+        z = bg.standardise({12: 12.0, 36: 40.0, 60: 99.0})  # 60 is not in the background
+        self.assertEqual(sorted(z), [12, 36])
+        self.assertAlmostEqual(z[12], (12.0 - X[:, 0].mean()) / X[:, 0].std(ddof=1))
+        lam, loc, scale = bg.noise_lambda([12, 24, 36])
+        Z = (X - X.mean(axis=0)) / X.std(axis=0, ddof=1)
+        np.testing.assert_allclose(lam, Z.max(axis=1))
+        self.assertTrue(np.isfinite(loc) and scale > 0)
+        # a long duration with large raw values does not dominate: its Z is what counts
+        self.assertGreater(z[12], z[36])
+        # degenerate backgrounds do not crash: none, one stream, no duration in common
+        for statistics in ({}, {"a": {12: 1.0}}, {"a": {12: 1.0}, "b": {24: 2.0}}):
+            small = Background(statistics)
+            lam, loc, scale = small.noise_lambda(small.durations)
+            self.assertTrue(np.isnan(loc) and np.isnan(scale))
+            self.assertFalse(np.any(np.isfinite(list(small.standardise({12: 5.0}).values()))))
+
+    def test_false_alarm_rate(self):
+        from lisatools.search.emri import false_alarm_rate
+
+        self.assertEqual(false_alarm_rate(5.0, [1.0, 5.0, 9.0]), 2 / 3)
+        self.assertEqual(false_alarm_rate(10.0, [1.0, 5.0, 9.0]), 0.0)
+        self.assertTrue(np.isnan(false_alarm_rate(1.0, [])))
+
+    def test_campaign(self):
+        if not HAVE_JAX:
+            raise unittest.SkipTest("JAX not installed")
+        from lisatools.search.emri import ResultStore, RunConfig, campaign_tasks
+
+        self.write_injection(noise_seed=1000)
+        for r in range(3):  # a spread to standardise by, and a Gumbel fit
+            self.write_noise(f"noise_{r:04d}", seed=100_000 + r)
+        run, out = self.run, self.run.out
+        logs = []
+        with self.fake_few():
+            summary = run.run(log=logs.append)  # search, background, collect
+            store = ResultStore(out)
+            for label in ("inj_000", "noise_0000"):
+                for n_seg in (12, 24):
+                    self.assertTrue(store.done(label, n_seg))
+            # resuming: nothing left to do, and nothing is regenerated
+            streams = list(run.search_streams()) + list(run.background_streams())
+            self.assertEqual(list(campaign_tasks(self.config, streams, store)), [])
+            self.assertTrue(all(stream._loaded is None for stream in streams))
+        records = store.load()
+        self.assertEqual(len(records), 8)  # 4 streams x 2 durations
+        inj = [r for r in records if r["label"] == "inj_000" and r["n_seg"] == 24][0]
+        noise = [r for r in records if r["label"] == "noise_0000"][0]
+        self.assertEqual((inj["kind"], inj["noise_seed"], inj["snr"]), ("injection", 1000, 40.0))
+        self.assertEqual((noise["kind"], noise["noise_seed"]), ("noise", 100_000))
+        self.assertEqual(inj["best_f"].shape, (24,))
+        self.assertEqual(inj["truth"], self.params)
+        # the directory refuses another configuration, and a stream remade on other noise
+        with self.assertRaises(ValueError):
+            RunConfig.from_toml(self.toml, ["optimizer.n_steps=4"]).run(["search"], log=logs.append)
+        self.write_injection(noise_seed=1001)  # remade on other noise
+        with self.fake_few(), self.assertRaises(ValueError):
+            run.run(["search"], log=logs.append)
+        # an injection searched on a background realisation is refused
+        self.write_injection(noise_seed=100_000)
+        with self.assertRaises(ValueError):
+            run.check_inputs()
+        self.write_injection(noise_seed=1000)
+        # labels must be unique across the inputs
+        from lisatools.search.emri import NoiseFile
+
+        duplicate = os.path.join(self.dir, "noise_dup.json")
+        NoiseFile.make(self.config, "inj_000", 100_010, self.T_data).save(duplicate)
+        with self.assertRaisesRegex(ValueError, "same label"):
+            run.check_inputs()
+        os.remove(duplicate)
+        # collect: one injection row against three background streams
+        self.assertEqual(len(summary["rows"]), 1)
+        row = summary["rows"][0]
+        self.assertEqual((row["label"], row["n_background"], row["n_durations"]), ("inj_000", 3, 2))
+        self.assertIn(row["duration"], (12, 24))
+        bg = summary["background"]
+        z = bg.standardise({n: r["best_statistic"] for n, r in store_by_n(records, "inj_000")})
+        self.assertAlmostEqual(row["statistic"], max(z.values()))
+        self.assertAlmostEqual(row["raw"], store_by_n(records, "inj_000", row["duration"]))
+        self.assertIn(row["far"], (0.0, 1 / 3, 2 / 3, 1.0))
+        self.assertTrue(0.0 <= row["far_gumbel"] <= 1.0)
+        self.assertEqual(
+            {k for k in row if k.startswith("detected_")},
+            {"detected_0.5", "detected_0.01", "detected_0.0001"},
+        )
+        self.assertTrue(np.isnan(row["agreement"]) or 0.0 <= row["agreement"] <= 1.0)
+        self.assertEqual(bg.durations, [12, 24])
+        self.assertEqual(summary["noise_lambda"].shape, (3,))
+        self.assertTrue(os.path.exists(os.path.join(out, "summary.csv")))
+        # collecting needs only the directory: the basis file may be gone
+        os.remove(self.config.basis.file)
+        reopened = ResultStore(out)
+        self.assertEqual(reopened.config, self.config)
+        self.assertEqual(reopened.fingerprint, store.fingerprint)
+        self.assertEqual(len(run.run(["collect"], log=logs.append)["rows"]), 1)
 
 
 if __name__ == "__main__":

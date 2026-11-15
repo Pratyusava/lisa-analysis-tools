@@ -1,0 +1,77 @@
+# Cutler & Bustamante-Rosell's excess-power statistic H on their Chebyshev phase model, the
+# basis built from a FEW track bank; data, durations and optimiser as Speri et al.'s search
+# (S_svd.toml), so the two campaigns differ only in the statistic and the basis.
+#
+#   python emri_search.py configs/H_chebyshev.toml
+#
+# The first run builds the basis (bank.n_tracks FEW tracks, ~0.25 s each) and saves it to
+# <out>/basis.npz; later runs load it. Another campaign can reuse it with
+# basis.source = "file" and basis.file = "../runs/H_chebyshev/basis.npz".
+# Only the tables this search uses are listed; reference.toml has every setting.
+
+out = "../runs/H_chebyshev"
+n_workers = 4
+tol_bins = 2.0
+p_fa = [0.5, 1e-2, 1e-4]
+
+[inputs]
+injections = ["../inj/*.json"]
+noise = ["../noise/*.json"]
+data = []
+
+[data]
+dt = 5.0
+T_sft = 5e4
+window_alpha = 0.2
+channels = "A"
+psd_file = "$EMRI_SEARCH_DIR/src/emrisearch/data/TDI2_AE_psd.npy"
+
+[statistic]
+name = "H"                # Cutler & Bustamante-Rosell's coherent excess power
+
+[statistic.H]
+band = [3e-4, 2e-2]       # band of the coherent FFT [Hz]; must hold the tracks
+windows = [2e3, 4.2e3, 1.72e4, 6.9e4]   # draft: 10, 21, 86, 345 delay cells of ~200 s
+delay_step = 200.0        # draft: delay-grid spacing [s]
+normalization = "exact"   # "exact" per template;  draft: "asymptotic" (R = L / K)
+window_alpha = 0.01       # Tukey taper of the stream before its FFT (0: a transient at delay 0)
+spans = [2.5e-3, 5e-3, 1e-2]   # template widths the population is bucketed by [Hz]; none: whole band
+
+[basis]
+name = "chebyshev"        # Cutler & Bustamante-Rosell's Chebyshev phase model
+source = "build"          # from the bank below; saved to <out>/basis.npz (or `file`)
+T_ref = 31558149.763545595   # plunge time of the bank tracks [s] (1 yr); the anchor time
+
+[basis.chebyshev]
+y_range = [-1.0, 1.0]     # anchor coordinate: the track's y at the end of the stream, anywhere in the band
+band = [3e-3, 8e-3]       # draft: 3-8 mHz; tracks are zero outside it
+n_coeffs = 5              # draft: 5
+margin = 0.2              # draft: a build widens the fitted range by 20 % at each end
+min_span = 1.9            # draft: a bank track enters the box when its fit covers 1.9 of the band's width 2
+box_scale = 1.0           # draft: 1 (catalogue box) or 10 (wide box)
+
+[basis.bank]
+n_tracks = 10_000         # PAPER: 10^4 (~0.25 s per track)
+seed = 2601               # REPO
+
+[basis.bank.prior]        # PAPER Table 1, uniform
+log10_m1 = [5.698970004336019, 6.698970004336019]   # m1 in [5e5, 5e6] Msun
+m2 = [1.0, 100.0]
+a = [0.0, 0.998]
+e_f = [0.0, 0.1]
+
+[durations]
+T_min = 0.1
+step = 12
+
+[optimizer]
+n_initial = 1024
+n_population = 512
+n_steps = 525
+patience = "none"
+min_improvement = 1e-3
+learning_rate = 1e-5
+F_range = [0.3, 1.5]
+p_elitism = 0.5
+batch_size = 32           # H's FFT has ~6x10^5 bins for 1 yr: start at 32 on 64 GB
+seed = 0

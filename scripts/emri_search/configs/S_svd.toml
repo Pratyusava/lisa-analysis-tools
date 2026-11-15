@@ -1,0 +1,59 @@
+# Speri et al.'s search (arXiv:2510.20891, github.com/lorenzsp/EMRI-Search): the semi-coherent
+# statistic S on Lorenzo's SVD basis, every setting at the paper's value (PAPER), the
+# repository's where the paper states none (REPO).
+#
+#   python emri_search.py configs/S_svd.toml            # search, background, collect
+#
+# Only the tables this search uses are listed; reference.toml has every setting (the other
+# statistic and basis included) with the same values.
+
+out = "../runs/S_svd"     # campaign directory: config.json, results/, summary.csv
+n_workers = 4             # processes
+tol_bins = 2.0            # localisation tolerance of the summary [bins]
+p_fa = [0.5, 1e-2, 1e-4]  # PAPER: false-alarm probabilities of the detection thresholds
+
+[inputs]
+injections = ["../inj/*.json"]  # injection files (make_injections.py), each on the noise it records
+noise = ["../noise/*.json"]      # PAPER: 100 noise files (make_noise.py), the background (FAR >= 1/n)
+data = []                        # data files searched as is (.npz: signal (n_channels, N), dt)
+
+[data]
+dt = 5.0                  # PAPER: cadence [s]
+T_sft = 5e4               # PAPER: segment duration [s]
+window_alpha = 0.2        # REPO: Tukey parameter of each segment's window
+channels = "A"            # PAPER: TDI channels ("AE" for both)
+psd_file = "$EMRI_SEARCH_DIR/src/emrisearch/data/TDI2_AE_psd.npy"   # REPO; none: LAT's analytic TDI2 PSD
+
+[statistic]
+name = "fresnel"          # Speri et al.'s S
+
+[statistic.fresnel]
+P = 100                   # PAPER: half-width of the bin window (2P + 1 bins per segment)
+f_min = 3.1622776601683794e-4   # PAPER: 10^-3.5 Hz; segments with f <= f_min do not count
+fdot_min = 1e-13          # PAPER: ... nor fdot <= fdot_min [Hz/s]
+dphi_max = 1.0            # PAPER: ... nor |fddot| T_sft^3 / 6 >= dphi_max
+
+[basis]
+name = "svd"              # Speri et al.'s SVD basis of FEW tracks
+source = "file"
+file = "$EMRI_SEARCH_DIR/examples/new_svd_basis_Tsft50000.0_cut20.npz"   # REPO
+T_ref = 31558149.763545595   # plunge time of the basis tracks [s] (REPO's file: 1 yr)
+
+[basis.svd]
+f0_range = [5e-4, 1e-2]   # PAPER: starting frequencies of the initial search tracks [Hz] (REPO QuickStart: 1e-3, 5e-3)
+
+[durations]
+T_min = 0.1               # PAPER: shortest analysed stream [yr]
+step = 12                 # PAPER: increment of the stream length [segments] (~7 d; 48 durations in 1 yr)
+
+[optimizer]
+n_initial = 1024          # PAPER: initial draws screened by the statistic (REPO QuickStart: 128)
+n_population = 512        # PAPER: best draws kept and optimised (REPO QuickStart: 64)
+n_steps = 525             # PAPER: Adam + DE iterations (REPO QuickStart: 200)
+patience = "none"         # PAPER: always n_steps;  e.g. 50: stop after 50 iterations without gain
+min_improvement = 1e-3    # relative gain that resets the patience
+learning_rate = 1e-5      # PAPER / REPO: Adam step size in unit-cube coordinates
+F_range = [0.3, 1.5]      # PAPER / REPO: DE differential weight
+p_elitism = 0.5           # REPO: probability that the DE base vector is the fittest member
+batch_size = "none"       # members evaluated at a time (memory only); 64 GB: none
+seed = 0                  # initial draws and DE (duration k adds k)

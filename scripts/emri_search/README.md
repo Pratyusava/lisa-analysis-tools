@@ -9,6 +9,10 @@ Bustamante-Rosell's `H` statistic and Chebyshev track model). Everything runs on
 | `setup_env_macos.sh` | Builds the `lat-emri` conda environment (dev stack + search extras) |
 | `emri_search_lorenzo.ipynb` | The notebook, committed with the toy run's outputs |
 | `build_emri_search_notebook.py` | The notebook's source: regenerates it, keeping the outputs of unchanged cells (see *Editing the notebook*) |
+| `emri_search.py` | Runs a campaign described by one TOML file: search injection / data files, the noise background, FARs (see *Running a campaign*) |
+| `configs/` | Campaign files: `S_svd.toml` (Speri et al.'s search), `H_chebyshev.toml` (Cutler & Bustamante-Rosell's `H` on a built Chebyshev basis), `reference.toml` (every setting, both statistics and bases) |
+| `make_injections.py` | Injection files for a campaign (FEW sources from the paper's prior), as recipes with checksums |
+| `make_noise.py` | Noise files for a campaign's background, as seeds with checksums |
 
 ## Setup
 
@@ -93,6 +97,84 @@ caffeinate -i jupyter nbconvert --to notebook --execute --inplace \
 
 Sec. 10 saves each statistic's results to `results_*/compare_<scale>_<statistic>.npz`; with
 `COMPARE_RESUME = True` a rerun skips the finished ones and continues a partial one.
+
+## Running a campaign
+
+`emri_search.py` runs the notebook's search on many streams, in parallel processes, from one
+campaign file (TOML); the library behind it is `lisatools.search.emri` (`RunConfig`,
+`SearchConfig`). The file lists:
+
+| Table | What it sets |
+|---|---|
+| top level | `out` (the campaign directory), `n_workers` |
+| `[inputs]` | `injections` and `noise` (recipe files or globs, see below), `data` (files searched as is) |
+| `[data]` | cadence, segments, channels, `psd_file` |
+| `[statistic]` | `name = "fresnel"` (Speri et al.'s S) or `"H"` (Cutler & Bustamante-Rosell); `[statistic.fresnel]`, `[statistic.H]` |
+| `[basis]` | `name = "svd"` or `"chebyshev"`; `source = "file"` (load `file`) or `"build"` (from the FEW bank in `[basis.bank]`, saved to `<out>/basis.npz` and reused); `[basis.svd]`, `[basis.chebyshev]` |
+| `[durations]`, `[optimizer]` | the analysed stream lengths, the initial screening and Adam + DE |
+
+`configs/reference.toml` lists every setting, of both statistics and both bases, with its value
+from the paper (`PAPER`), Lorenzo's repository (`REPO`) or the Cutler & Bustamante-Rosell draft
+(`draft`); these are also the defaults. The run configs list only the tables they use:
+`S_svd.toml` has `[statistic.fresnel]` and `[basis.svd]`, `H_chebyshev.toml` has
+`[statistic.H]`, `[basis.chebyshev]` and the `[basis.bank]` its build draws; data, durations
+and optimiser are the same in both, so the two campaigns differ only in the statistic and the
+basis. An omitted key takes its default. Paths may use `$EMRI_SEARCH_DIR` and `~` and are
+relative to the file; `"none"` switches off an optional setting. Only the chosen statistic's
+and basis's settings identify a campaign.
+
+**Injection and noise files are recipes, not samples** (a few kB of JSON each, instead of 50 MB
+per channel for a year):
+
+- `make_injections.py` writes one file per injection: the source parameters (with the distance
+  that gives the target SNR and the initial conditions, so the signal is regenerated directly
+  with FEW), the seed of the noise it is searched on (`--noise-seed + k`), and checksums of
+  both. It draws from the paper's Table 1 prior and keeps sources starting in `--f0-range`
+  (default the paper's 0.5-10 mHz); from the campaign file it takes only the cadence, channels,
+  PSD, durations and basis grid, so the plunges fall where the search looks.
+- `make_noise.py` writes the background: one file per noise-only stream, its seed (`--seed + r`)
+  and a checksum. The paper used 100 streams; a FAR resolves down to `1 / n`.
+
+Each search regenerates the data and checks it against the file's checksum (each channel's power
+and a few hundred samples, to 1e-10) and against the campaign's cadence, channels and PSD. A
+NumPy, LAT or FEW version that produces different data therefore stops the search with an error
+naming the versions the file was made with, instead of searching different data. The search also
+refuses an injection whose noise seed is one of the background's, and a result whose stream file
+was remade with another noise seed. Searching injections needs FEW.
+
+```sh
+conda activate lat-emri
+cd scripts/emri_search
+export EMRI_SEARCH_DIR=~/Documents/Research/LISA/EMRI-Search   # Lorenzo's basis and PSD files
+
+# 1. the inputs: 100 injections at SNR 20 (FEW) and 100 noise-only streams, one year each
+python make_injections.py configs/S_svd.toml --out inj --n 100 --snrs 20 --T-data 1.0
+python make_noise.py configs/S_svd.toml --out noise --n 100 --T-data 1.0
+
+# 2. the campaign: search the injections, then the background, then the summary
+python emri_search.py configs/S_svd.toml
+python emri_search.py configs/H_chebyshev.toml         # the other statistic and basis, same injections
+
+# stages one at a time, a setting changed on the command line, the resolved configuration
+python emri_search.py configs/S_svd.toml search background collect
+python emri_search.py configs/S_svd.toml --set statistic.name=H --set out=../runs/H_svd
+python emri_search.py configs/S_svd.toml --show
+```
+
+The campaign directory holds `config.json` (the resolved search configuration), `fingerprint`,
+`results/` (one `.npz` per stream and duration) and `summary.csv` / `summary.npz`. The summary
+follows Speri et al. (Sec. III.1, the notebook's Sec. 9): the best statistic `X_k` of each
+duration is standardised by the noise-only searches at that duration, `Z_k = (X_k - mu_k) /
+sigma_k`, and a stream's detection statistic is `Lambda = max_k Z_k` (raw values are not compared
+across durations: they grow with the stream's length). Each row has `Lambda` (`statistic`), the
+duration it peaks at and the raw `X` there; `far`, the fraction of noise streams whose `Lambda`
+is at least as large (it resolves down to one over the number of noise files); `far_gumbel`,
+from a Gumbel fit to the noise `Lambda` (the paper's: location 1.94, scale 0.56);
+`detected_<p>` at each false-alarm probability of `p_fa` (paper: 0.5, 1e-2, 1e-4); and how well
+the best track follows the injected one. The standardisation needs at least 2 noise streams and
+the Gumbel fit 3. A directory accepts only one configuration, and reruns skip the searches whose
+result file exists, so an interrupted campaign continues where it stopped. A data file is an
+`.npz` with `signal` of shape `(n_channels, N)` and `dt`, listed in `inputs.data`.
 
 ## Editing the notebook
 

@@ -15,6 +15,9 @@ The SNR sums every rFFT bin of the injected duration (EMRI-Search's
 (multiples of ~0.03 Hz) have ``S(f)`` near zero and dominate that sum, so pass
 ``snr_band=(0, F_TDI_ZERO_GUARD)`` (0.025 Hz) there; EMRI-Search's tabulated PSD
 (``SensitivityPSD.from_file(..., clip_to_first=True)``) has no such zeros.
+
+:func:`draw_sources` draws the sources of a campaign's injections from the paper's
+prior (:data:`TABLE1_PRIOR`), placed so they plunge where the search looks.
 """
 
 import warnings
@@ -35,6 +38,16 @@ DEFAULT_ANGLES = dict(qS=np.pi / 3, phiS=0.0, qK=np.pi / 3, phiK=0.0)
 _CHANNEL_INDEX = {"A": 0, "E": 1, "T": 2}
 F_TDI_ZERO_GUARD = 0.025
 """[Hz] Below the first TDI2 transfer zero (~0.03 Hz); see the module docs."""
+
+PAPER_F0_RANGE = (5e-4, 1e-2)
+"""[Hz] Speri et al.: starting frequencies of the searched tracks."""
+TABLE1_PRIOR = {
+    "log10_m1": (float(np.log10(5e5)), float(np.log10(5e6))),
+    "m2": (1.0, 100.0),
+    "a": (0.0, 0.998),
+    "e_f": (0.0, 0.1),
+}
+"""Speri et al. Table 1: the source population, uniform in each parameter."""
 
 
 def random_angles(rng=None) -> dict:
@@ -383,3 +396,68 @@ class FEWInjector:
         return EMRIInjection(
             scale * h[:, :n_keep], self.dt, out_params, float(snr), self.channels, psd
         )
+
+
+def draw_sources(
+    config,
+    n,
+    seed,
+    T_data,
+    prior=TABLE1_PRIOR,
+    f0_range=PAPER_F0_RANGE,
+    max_draws=None,
+):
+    """Draw ``n`` sources for a campaign's injections.
+
+    Each source is drawn from ``prior`` and plunges at the end of one of the durations the
+    search analyses, chosen at random, so its plunge falls on the search's grid. A draw is
+    kept when FEW can integrate it back to the start of the stream and its ``m = 2`` track
+    starts inside ``f0_range``.
+
+    Args:
+        config: The campaign's :class:`~.config.SearchConfig`. Only its data, durations and
+            basis grid are used, whichever statistic and basis are chosen.
+        n: Sources to return.
+        seed: Seed of the draws.
+        T_data: Length of the streams [yr].
+        prior: Uniform ranges of ``log10_m1``, ``m2``, ``a``, ``e_f`` (paper Table 1).
+        f0_range: Allowed starting frequencies [Hz] (the paper's 0.5-10 mHz).
+        max_draws: Give up after this many draws (``None``: never).
+
+    Returns:
+        A list of ``(m1, m2, a, T_pl, e_f)``, with ``T_pl`` in years.
+    """
+    from .tracks import FEWHarmonicTrackModel
+
+    T_sft = config.data.T_sft
+    n_segments = int(config.n_samples(T_data) * config.data.dt // T_sft)
+    durations = config.durations_of(n_segments)
+    segment_times = np.arange(durations[-1]) * T_sft
+    search_model = config.track_model(segment_times, force_backend="cpu")
+    true_track = FEWHarmonicTrackModel(segment_times, m=2, n=0)
+
+    names = ("log10_m1", "m2", "a", "e_f")
+    lower = np.array([prior[name][0] for name in names])
+    upper = np.array([prior[name][1] for name in names])
+    rng = np.random.default_rng(seed)
+
+    sources: list = []
+    n_draws = 0
+    while len(sources) < n:
+        n_draws += 1
+        if max_draws is not None and n_draws > max_draws:
+            raise RuntimeError(f"only {len(sources)} of {n} sources after {max_draws} draws.")
+        log10_m1, m2, a, e_f = rng.uniform(lower, upper)
+        plunge_duration = int(rng.choice(durations)) * T_sft
+        # the search shifts the basis tracks (which plunge at T_ref) by whole segments;
+        # the injection plunges where that shifted grid puts the end of the chosen duration
+        shift = search_model.shift_for_plunge(plunge_duration)
+        T_pl = (config.basis.T_ref + shift * T_sft) / YRSID_SI
+        source = (float(10**log10_m1), float(m2), float(a), float(T_pl), float(e_f))
+        try:
+            f_start = true_track(source).f[0]
+        except Exception:  # FEW cannot integrate this draw back to t = 0
+            continue
+        if f0_range[0] <= f_start <= f0_range[1]:
+            sources.append(source)
+    return sources
