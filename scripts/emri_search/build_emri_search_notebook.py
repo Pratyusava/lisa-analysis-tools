@@ -37,7 +37,7 @@ with the modular re-implementation in `lisatools.search.emri`.
 1. **Inject** a FEW Kerr eccentric equatorial EMRI through LISA's TDI response, scaled to a target SNR, into Gaussian noise.
 2. **Segment** the data into short Fourier transforms (SFTs).
 3. **Score** a frequency track with the semi-coherent linear-chirp (Fresnel) statistic, or with Cutler & Bustamante-Rosell's coherent excess-power statistic $H$ (Sec. 4b, `STATISTIC`).
-4. **Parametrise** tracks by an SVD basis of FEW tracks, shifted in time to a trial plunge.
+4. **Parametrise** tracks by an SVD basis of FEW tracks shifted in time to a trial plunge, or by Cutler & Bustamante-Rosell's Chebyshev phase model (Sec. 5, `BASIS`).
 5. **Optimise** the basis coefficients with Lorenzo's Adam + differential-evolution hybrid, once per data duration.
 6. **Background**: repeat on noise-only data, normalise the statistic per duration, fit a Gumbel distribution to the noise maxima, set false-alarm thresholds, and decide detection.
 7. **Compare** statistics on the same injections: localisation and detection versus SNR (Sec. 10).
@@ -80,6 +80,8 @@ from lisatools.search.emri import (
     AdamDE,
     EMRISearch,
     ExcessPowerStatistic,
+    ChebyshevBasis,
+    ChebyshevTrackModel,
     FEWHarmonicTrackModel,
     few_track_bank,
     FEWInjector,
@@ -94,6 +96,7 @@ from lisatools.search.emri import (
     Track,
     band_snr,
 )
+from lisatools.sources.emri.chebyshevwave import chebyshev_fit, chebyshev_u
 from lisatools.utils.constants import YRSID_SI
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -192,32 +195,42 @@ SOURCE = (M1, M2, SPIN, T_PL, E_F)
 """)
 
 md(r"""
-### 1d. SVD track basis
+### 1d. Track basis
 
-Two ways to get the basis the search parametrises tracks with (Sec. 5):
+`BASIS` picks how a search track is parametrised (Sec. 5): `"svd"`, Lorenzo's SVD basis of FEW tracks, or
+`"chebyshev"`, Cutler & Bustamante-Rosell's expansion of the inverse chirp rate over a band. Either comes from a file or is
+built from a bank of FEW tracks:
 
-* `BASIS_SOURCE = "file"`: load `BASIS_FILE`, an `.npz` with `V_K`, `lb`, `ub` (and `S_K`): Lorenzo's basis, or one
-  saved by an earlier `"build"`.
-* `BASIS_SOURCE = "build"`: draw `N_BANK` FEW $m = 2$ tracks from `SOURCE_PRIOR`, all plunging at `T_REF`, take the SVD,
-  keep `N_MODES` modes and the coefficient box, and save the basis to `BASIS_SAVE`.
+* `BASIS_SOURCE = "file"`: load `BASIS_FILE` (an SVD file holds `V_K`, `lb`, `ub`, `S_K`: Lorenzo's basis or one saved by an
+  earlier build; a Chebyshev file holds the coefficient box and the band).
+* `BASIS_SOURCE = "build"`: draw `N_BANK` FEW $m = 2$ tracks from `SOURCE_PRIOR`, all plunging at `T_REF`; for `"svd"` take
+  the SVD and keep `N_MODES` modes and the coefficient box, for `"chebyshev"` fit each track's coefficients and take their
+  box; save the basis to `BASIS_SAVE`.
 
 | Input | Symbol | Meaning |
 |---|---|---|
-| `T_REF` | $T_{\rm ref}$ | Plunge time of the basis tracks, both options (Lorenzo's file: 1 yr); the basis grid is $t_\alpha = \alpha T_{\rm SFT} < T_{\rm ref}$ |
+| `T_REF` | $T_{\rm ref}$ | Plunge time of the basis tracks (Lorenzo's file: 1 yr) and anchor time of the Chebyshev model; the basis grid is $t_\alpha = \alpha T_{\rm SFT} < T_{\rm ref}$ |
 | `N_BANK` | $N$ | Tracks in the bank (paper: $10^4$; Lorenzo's file holds 46 371) |
 | `SOURCE_PRIOR` | | Uniform ranges of $(\log_{10} m_1, m_2, a, e_f)$ (paper Table 1); also the source prior of the comparison, Sec. 10 |
-| `N_MODES` | $K$ | Retained singular vectors |
-| `BOX_QUANTILE` | $q$ | Coefficient box $[Q_q, Q_{1-q}]$ per mode |
-| `FIRST_MODE_MAX` | | Mode 1's upper edge is the bank's maximum instead of $Q_{1-q}$, as in Lorenzo's file |
 | `BANK_SEED` | | Seed of the draws |
+| `N_MODES` | $K$ | SVD: retained singular vectors |
+| `BOX_QUANTILE` | $q$ | SVD: coefficient box $[Q_q, Q_{1-q}]$ per mode |
+| `FIRST_MODE_MAX` | | SVD: mode 1's upper edge is the bank's maximum instead of $Q_{1-q}$, as in Lorenzo's file |
+| `CHEB_BAND` | $[f_{\min}, f_{\max}]$ | Chebyshev: the band (draft: 3–8 mHz); tracks are zero outside it |
+| `CHEB_N_COEFFS` | $n$ | Chebyshev: coefficients $\alpha_0 \dots \alpha_{n-1}$ (draft: 5) |
+| `CHEB_MARGIN` | | Chebyshev: margin added to the fitted coefficients' range at each end (draft: 20 %) |
+| `CHEB_MIN_SPAN` | | Chebyshev: a bank track enters the box when its fit covers this much of the band's width 2 in $y$ (draft: 1.9) |
+| `CHEB_BOX_SCALE` | | Chebyshev: widen the box about its centre (draft: 1, the catalogue box, or 10) |
+| `CHEB_Y_RANGE` | | Chebyshev search coordinate: the track's $y$ (log frequency in the band) at the end of the stream |
 | `BASIS_SAVE` | | Where a built basis is saved (point `BASIS_FILE` at it to reuse it) |
 """)
 
 code(r"""
-BASIS_SOURCE = "file"        # "file": BASIS_FILE;  "build": the SVD of a FEW track bank with the inputs below
-BASIS_FILE = os.path.join(EMRI_SEARCH_DIR, "examples/new_svd_basis_Tsft50000.0_cut20.npz")   # Lorenzo's basis
-T_REF = YRSID_SI             # the basis tracks plunge at T_REF (Lorenzo's file: 1 yr)
-# "build" inputs
+BASIS = "svd"                # "svd": Lorenzo's SVD basis of FEW tracks;  "chebyshev": Cutler & Bustamante-Rosell's phase model
+BASIS_SOURCE = "file"        # "file": BASIS_FILE;  "build": from a FEW track bank with the inputs below
+BASIS_FILE = os.path.join(EMRI_SEARCH_DIR, "examples/new_svd_basis_Tsft50000.0_cut20.npz")   # Lorenzo's SVD basis
+T_REF = YRSID_SI             # the basis tracks plunge at T_REF (Lorenzo's file: 1 yr); the Chebyshev anchor time
+# "build": the FEW track bank
 N_BANK = 1_000               # PAPER: 10_000 (~0.25 s per track on a laptop);  Lorenzo's file: 46_371 tracks
 SOURCE_PRIOR = {             # PAPER (Table 1); also the source prior of the comparison (Sec. 10)
     "log10_m1": (np.log10(5e5), np.log10(5e6)),
@@ -225,11 +238,19 @@ SOURCE_PRIOR = {             # PAPER (Table 1); also the source prior of the com
     "a": (0.0, 0.998),
     "e_f": (0.0, 0.1),
 }
+BANK_SEED = 2601
+# "svd"
 N_MODES = 20                 # PAPER / REPO: 20
 BOX_QUANTILE = 0.015         # REPO (matches lb / ub in Lorenzo's file); paper text: "symmetric 3 sigma"
 FIRST_MODE_MAX = True        # REPO: mode 1's upper edge is the maximum of the bank
-BANK_SEED = 2601
-BASIS_SAVE = os.path.join(RESULTS_DIR, f"svd_basis_{N_BANK}x{N_MODES}.npz")
+# "chebyshev"
+CHEB_BAND = (3e-3, 8e-3)     # CB-R draft: 3-8 mHz
+CHEB_N_COEFFS = 5            # CB-R draft: 5 for the search (9 for its catalogue fits)
+CHEB_MARGIN = 0.2            # CB-R draft: 20 % of each coefficient's range at each end
+CHEB_MIN_SPAN = 1.9          # CB-R draft: a fit must cover 1.9 of the band's width 2 in y
+CHEB_BOX_SCALE = 1.0         # CB-R draft: 1 (catalogue box) or 10 (wide box)
+CHEB_Y_RANGE = (-1.0, 1.0)   # anchor coordinate: the track's y at the end of the stream, anywhere in the band
+BASIS_SAVE = os.path.join(RESULTS_DIR, f"{BASIS}_basis_{N_BANK}.npz")
 """)
 
 md(r"""
@@ -604,11 +625,11 @@ plt.legend(); plt.tight_layout()
 
 # --------------------------------------------------------------------------- basis
 md(r"""
-## 5. SVD basis of frequency tracks
+## 5. Track basis
 
-A bank of $N$ FEW $m = 2$ tracks $f_{i,\alpha} = f(t_\alpha;\theta_i)$, all plunging at $T_{\rm ref}$, on the segment grid
-$t_\alpha = \alpha T_{\rm SFT} < T_{\rm ref}$ (632 samples for 1 yr; the segment that does not complete before the plunge is
-set to zero), is decomposed and truncated (paper Eqs. 9–10):
+**SVD basis (Speri et al.).** A bank of $N$ FEW $m = 2$ tracks $f_{i,\alpha} = f(t_\alpha;\theta_i)$, all plunging at
+$T_{\rm ref}$, on the segment grid $t_\alpha = \alpha T_{\rm SFT} < T_{\rm ref}$ (632 samples for 1 yr; the segment that does
+not complete before the plunge is set to zero), is decomposed and truncated (paper Eqs. 9–10):
 
 $$
 f_{i,\alpha} = \sum_{p} U_{ip}\, S_p\, V_{p\alpha} \;\approx\; \sum_{p=1}^{K} W_{ip}\, V_{p\alpha}, \qquad W_{ip} = U_{ip} S_p .
@@ -618,50 +639,117 @@ A search track is any $f_\alpha(c) = \sum_p c_p V_{p\alpha}$ with coefficients i
 $\ell_p = Q_{q}(W_{\cdot p})$, $u_p = Q_{1-q}(W_{\cdot p})$ ($u_1 = \max_i W_{i1}$ with `FIRST_MODE_MAX`), parametrised by the
 unit cube $\xi \in [0,1]^K$: $c_p = \ell_p + \xi_p (u_p - \ell_p)$.
 
-`"file"` loads such a basis; `"build"` computes it (`few_track_bank` + `SVDBasis.build`) and saves it. The checks below
-hold for either: the singular-value spectrum, the range of starting frequencies the box reaches, and where the injected
-source sits in the box (its track plunging at $T_{\rm ref}$, projected on the modes: a $\xi_p$ outside $[0, 1]$ means the
-search cannot represent it exactly).
+**Chebyshev basis (Cutler & Bustamante-Rosell).** Instead of a basis of tracks, the inverse chirp rate is expanded over a
+band. With $y = \ln(f/f_{\rm mid})/\kappa \in [-1, 1]$, $f_{\rm mid} = \sqrt{f_{\min} f_{\max}}$,
+$\kappa = \tfrac12 \ln(f_{\max}/f_{\min})$ (draft Eqs. 13–14),
+
+$$
+\ln \Lambda(y) = \sum_{i=0}^{n-1} \alpha_i\, U_i(y), \qquad \Lambda \equiv f_{\rm mid}^2\, \frac{dt}{df},
+$$
+
+$U_i$ the Chebyshev polynomials of the second kind ($n = 5$). One integration gives $t(f)$ and inverting it the track
+$f(t)$, with $\dot f = f_{\rm mid}^2 / \Lambda$; the track is zero outside the band. The box $[\ell_i, u_i]$ is the range of
+the coefficients fitted to the bank's tracks (least squares of $\ln\Lambda$ on the $U_i$, for tracks covering at least
+`CHEB_MIN_SPAN` of the band) with a `CHEB_MARGIN` margin, widened by `CHEB_BOX_SCALE` (the draft's catalogue and 10× boxes).
+The draft fixes the track's time origin by scanning delays, which only $H$ does; here the placement is a sixth search
+coordinate, the track's $y$ at the end of the stream (`CHEB_Y_RANGE`), which the duration scan of Sec. 6 moves with the
+stream end exactly like the SVD plunge shift. The model itself is LAT's
+`lisatools.sources.emri.chebyshevwave.ChebyshevWave` (Curt Cutler's code, vectorised by Michael Katz and made
+differentiable for the search; `t` in seconds); `ChebyshevTrackModel` only adds the box, the anchor and the segment
+sampling, and the tests check that `chebyshev_fit` reproduces the draft's catalogue coefficients.
+
+The checks below show where the injected source sits in the chosen basis: for the SVD, its track plunging at $T_{\rm ref}$
+projected on the modes (a $\xi_p$ outside $[0, 1]$ means the search cannot represent it exactly); for the Chebyshev model,
+its fitted coefficients against the box, and how well $n$ coefficients reproduce its track over the band.
 """)
 
 code(r"""
 t_basis = np.arange(0.0, T_REF, T_SFT)                        # the basis grid (632 samples for T_REF = 1 yr)
-if BASIS_SOURCE == "file":
-    basis = SVDBasis.from_npz(BASIS_FILE)
-    print(f"basis from {BASIS_FILE}")
-elif BASIS_SOURCE == "build":
-    bank, bank_params = few_track_bank(SOURCE_PRIOR, N_BANK, t_basis, T_REF, seed=BANK_SEED)
-    basis = SVDBasis.build(bank, N_MODES, box_quantile=BOX_QUANTILE, first_mode_max=FIRST_MODE_MAX)
-    basis.save_npz(BASIS_SAVE)
-    print(f"{elapsed()} basis built from {len(bank)} tracks and saved to {BASIS_SAVE}")
-else:
-    raise ValueError(f"BASIS_SOURCE must be 'file' or 'build', not {BASIS_SOURCE!r}")
-if basis.n_samples != t_basis.size:
-    raise ValueError(f"the basis has {basis.n_samples} samples but T_REF / T_SFT give {t_basis.size}")
-f_lo, f_hi = basis.frequency_range()
-print(f"{basis.n_modes} modes x {basis.n_samples} samples; the box's tracks start between {f_lo * 1e3:.2f} and "
-      f"{f_hi * 1e3:.2f} mHz (negative starts are dropped from the initial population)")
-
-# The injected source in this basis: its track plunging at T_REF, projected on the modes.
-f_src = FEWHarmonicTrackModel(t_basis, m=2, n=0)((M1, M2, SPIN, T_REF / YRSID_SI, E_F)).f
-f_src[t_basis + T_SFT > T_REF] = 0.0                            # the segment that does not complete before the plunge
-c_src = basis.V @ f_src
-xi_src = (c_src - basis.lb) / (basis.ub - basis.lb)
-outside = np.flatnonzero((xi_src < 0) | (xi_src > 1))
-rel_err = np.linalg.norm(f_src - c_src @ basis.V) / np.linalg.norm(f_src)
-print(f"injected source: xi in [{xi_src.min():.2f}, {xi_src.max():.2f}], modes outside the box: {outside.tolist()}; "
-      f"projection error {rel_err:.1e}")
-
-fig, ax = plt.subplots(1, 2, figsize=(11, 3.5))
-if basis.S is not None:
-    ax[0].semilogy(np.arange(1, basis.n_modes + 1), basis.S / basis.S[0], "o-")
-ax[0].set_xlabel("mode p"); ax[0].set_ylabel(r"$S_p / S_1$"); ax[0].set_title("singular values")
 if BASIS_SOURCE == "build":
-    for i in np.linspace(0, len(bank) - 1, 15, dtype=int):
-        ax[1].plot(t_basis / YRSID_SI, bank[i] * 1e3, color="grey", lw=0.5, alpha=0.5)
-ax[1].plot(t_basis / YRSID_SI, f_src * 1e3, "k", lw=3, alpha=0.3, label=r"source track, plunge at $T_{\rm ref}$")
-ax[1].plot(t_basis / YRSID_SI, (c_src @ basis.V) * 1e3, "C1", lw=1, label=f"its projection on {basis.n_modes} modes")
-ax[1].set_xlabel("t [yr]"); ax[1].set_ylabel("f [mHz]"); ax[1].legend()
+    bank = few_track_bank(SOURCE_PRIOR, N_BANK, t_basis, T_REF, seed=BANK_SEED)
+    print(f"{elapsed()} bank: {len(bank.f)} FEW m=2 tracks plunging at T_REF")
+elif BASIS_SOURCE != "file":
+    raise ValueError(f"BASIS_SOURCE must be 'file' or 'build', not {BASIS_SOURCE!r}")
+
+if BASIS == "svd":
+    if BASIS_SOURCE == "file":
+        basis = SVDBasis.from_npz(BASIS_FILE)
+        print(f"SVD basis from {BASIS_FILE}")
+    else:
+        basis = SVDBasis.build(bank.f, N_MODES, box_quantile=BOX_QUANTILE, first_mode_max=FIRST_MODE_MAX)
+    if basis.n_samples != t_basis.size:
+        raise ValueError(f"the basis has {basis.n_samples} samples but T_REF / T_SFT give {t_basis.size}")
+    f_lo, f_hi = basis.frequency_range()
+    print(f"{basis.n_modes} modes x {basis.n_samples} samples; the box's tracks start between {f_lo * 1e3:.2f} and "
+          f"{f_hi * 1e3:.2f} mHz (negative starts are dropped from the initial population)")
+elif BASIS == "chebyshev":
+    if BASIS_SOURCE == "file":
+        basis = ChebyshevBasis.from_npz(BASIS_FILE)
+        print(f"Chebyshev basis from {BASIS_FILE}")
+    else:
+        basis = ChebyshevBasis.fit(bank.f, bank.fdot, n_coeffs=CHEB_N_COEFFS, band=CHEB_BAND, margin=CHEB_MARGIN,
+                                   min_span=CHEB_MIN_SPAN, scale=CHEB_BOX_SCALE)
+        print(f"{len(basis.fits)} of {len(bank.f)} bank tracks cover the band and enter the box")
+    print(f"{basis.n_coeffs} coefficients over {basis.band[0] * 1e3:g}-{basis.band[1] * 1e3:g} mHz; "
+          f"box lb = {np.round(basis.lb, 2)}, ub = {np.round(basis.ub, 2)}")
+else:
+    raise ValueError(f"BASIS must be 'svd' or 'chebyshev', not {BASIS!r}")
+if BASIS_SOURCE == "build":
+    basis.save_npz(BASIS_SAVE)
+    print(f"saved to {BASIS_SAVE}")
+
+
+def make_track_model(t_alpha, force_backend):
+    # The search's track model on the segment grid t_alpha (Secs. 6-10): a unit-cube point -> Track.
+    if BASIS == "svd":
+        return SVDTrackModel(basis, t_alpha, T_ref=T_REF, force_backend=force_backend)
+    return ChebyshevTrackModel(basis, t_alpha, T_ref=T_REF, y_range=CHEB_Y_RANGE, force_backend=force_backend)
+
+
+# The injected source in this basis: its m=2 track plunging at T_REF, on the basis grid.
+src = FEWHarmonicTrackModel(t_basis, m=2, n=0)((M1, M2, SPIN, T_REF / YRSID_SI, E_F))
+f_src, fdot_src = np.array(src.f), np.array(src.fdot)
+f_src[t_basis + T_SFT > T_REF] = 0.0                            # the segment that does not complete before the plunge
+fdot_src[t_basis + T_SFT > T_REF] = 0.0
+fig, ax = plt.subplots(1, 2, figsize=(11, 3.5))
+if BASIS == "svd":
+    c_src = basis.V @ f_src
+    xi_src = (c_src - basis.lb) / (basis.ub - basis.lb)
+    outside = np.flatnonzero((xi_src < 0) | (xi_src > 1))
+    rel_err = np.linalg.norm(f_src - c_src @ basis.V) / np.linalg.norm(f_src)
+    print(f"injected source: xi in [{xi_src.min():.2f}, {xi_src.max():.2f}], modes outside the box: {outside.tolist()}; "
+          f"projection error {rel_err:.1e}")
+    if basis.S is not None:
+        ax[0].semilogy(np.arange(1, basis.n_modes + 1), basis.S / basis.S[0], "o-")
+    ax[0].set_xlabel("mode p"); ax[0].set_ylabel(r"$S_p / S_1$"); ax[0].set_title("singular values")
+    if BASIS_SOURCE == "build":
+        for i in np.linspace(0, len(bank.f) - 1, 15, dtype=int):
+            ax[1].plot(t_basis / YRSID_SI, bank.f[i] * 1e3, color="grey", lw=0.5, alpha=0.5)
+    ax[1].plot(t_basis / YRSID_SI, f_src * 1e3, "k", lw=3, alpha=0.3, label=r"source track, plunge at $T_{\rm ref}$")
+    ax[1].plot(t_basis / YRSID_SI, (c_src @ basis.V) * 1e3, "C1", lw=1, label=f"its projection on {basis.n_modes} modes")
+    ax[1].set_xlabel("t [yr]"); ax[1].set_ylabel("f [mHz]"); ax[1].legend()
+else:
+    alpha_src, span_src, rms_src = chebyshev_fit(f_src, fdot_src, basis.band, basis.n_coeffs)
+    xi_src = (alpha_src - basis.lb) / (basis.ub - basis.lb)
+    outside = np.flatnonzero((xi_src < 0) | (xi_src > 1))
+    print(f"injected source: alpha = {np.round(alpha_src, 3)}, xi in [{xi_src.min():.2f}, {xi_src.max():.2f}], "
+          f"coefficients outside the box: {outside.tolist()}; the fit covers {span_src / 2:.0%} of the band, "
+          f"rms(ln Lambda) = {rms_src:.1e}")
+    in_band = (f_src >= basis.band[0]) & (f_src <= basis.band[1]) & (fdot_src > 0)
+    y_grid = np.linspace(-1.0, 1.0, 201)
+    U_grid = chebyshev_u(y_grid, basis.n_coeffs)
+    if basis.fits is not None:
+        for a_ in basis.fits[:: max(1, len(basis.fits) // 30)]:
+            ax[0].plot(y_grid, a_ @ U_grid, color="grey", lw=0.5, alpha=0.5)
+    ax[0].plot(basis.y(f_src[in_band]), np.log(basis.f_mid**2 / fdot_src[in_band]), "k", lw=3, alpha=0.3, label="source")
+    ax[0].plot(y_grid, alpha_src @ U_grid, "C1", lw=1, label=f"{basis.n_coeffs}-coefficient fit")
+    ax[0].set_xlabel(r"$y = \ln(f / f_{\rm mid}) / \kappa$"); ax[0].set_ylabel(r"$\ln \Lambda$"); ax[0].legend()
+    ax[0].set_title("inverse chirp rate" + (" (grey: the bank's fits)" if basis.fits is not None else ""))
+    t_mid = np.interp(basis.f_mid, f_src[in_band], t_basis[in_band])       # when the source crosses f_mid
+    t_fit, f_fit, _ = ChebyshevTrackModel(basis, t_basis, T_ref=t_mid, force_backend="cpu").grid(alpha_src, 0.0, t_mid)
+    ax[1].plot(t_basis[in_band] / 86400, f_src[in_band] * 1e3, "k", lw=3, alpha=0.3, label="source track in the band")
+    ax[1].plot(t_fit / 86400, f_fit * 1e3, "C1", lw=1, label="track of the fitted coefficients")
+    ax[1].set_xlabel("t [d]"); ax[1].set_ylabel("f [mHz]"); ax[1].legend()
 plt.tight_layout()
 """)
 
@@ -679,13 +767,14 @@ $$
 then keeps the data's segments; $\dot f_\alpha$ is the central difference of $f_\alpha$ over $t_\alpha$ and
 $\ddot f_\alpha$ (for the mask) that of $\dot f_\alpha$.
 The paper analyses progressively longer streams of $n_k = n_{\min} + 12k$ segments, from $T_{\min} = 0.1$ yr,
-and assumes the plunge at the end of each stream: $T_{\rm pl} = n_k T_{\rm SFT}$.
+and assumes the plunge at the end of each stream: $T_{\rm pl} = n_k T_{\rm SFT}$. The Chebyshev model has no plunge; the same
+shift moves the anchor of its last coordinate (its frequency at the end of the stream) with the stream end.
 """)
 
 code(r"""
 N_MIN = int(T_MIN * YRSID_SI / T_SFT)
 DURATIONS = list(range(N_MIN, N_SEG_TOTAL + 1, DURATION_STEP))
-probe = SVDTrackModel(basis, full.t_alpha, T_ref=T_REF, force_backend="cpu")
+probe = make_track_model(full.t_alpha, "cpu")
 print(f"{len(DURATIONS)} durations [segments]: {DURATIONS}")
 print("plunge shifts:", [probe.shift_for_plunge(n * T_SFT) for n in DURATIONS])
 print(f"source plunges at segment {T_PL * YRSID_SI / T_SFT:.2f}")
@@ -753,10 +842,11 @@ def make_search(stream, n_seg, signal=True, statistic=None, budget=None):
     # The search of the first n_seg segments of `stream` (an EMRIInjection with fixed noise),
     # plunge at the end of the stream; signal=False searches its noise alone. budget overrides search_budget().
     data, stat, t_alpha = make_data_and_statistic(stream, n_seg, signal, statistic)
-    model = SVDTrackModel(basis, t_alpha, T_ref=T_REF, force_backend="jax")
+    model = make_track_model(t_alpha, "jax")
     budget = budget or {}
     search = EMRISearch(data, stat, model, make_optimizer(**budget), n_initial=N_INITIAL,
-                        n_population=search_budget(**budget)["n_population"], initial_kwargs={"f0_range": F0_RANGE},
+                        n_population=search_budget(**budget)["n_population"],
+                        initial_kwargs={"f0_range": F0_RANGE} if BASIS == "svd" else {},
                         spans=H_SPANS if isinstance(stat, ExcessPowerStatistic) else None)
     return search, data, stat
 
@@ -991,15 +1081,34 @@ def comparison_tasks(statistic, sources, done_inj, done_noise):
                              keep_history=False)
 
 
-def comparison_settings(statistic, sources):
-    # What a saved comparison must match to be resumed.
+def basis_settings():
+    # What identifies the track basis of Sec. 5 (file, or the build inputs) and its search coordinates.
+    source = BASIS_FILE if BASIS_SOURCE == "file" else (N_BANK, sorted(SOURCE_PRIOR.items()), BANK_SEED, T_REF)
+    if BASIS == "svd":
+        return (BASIS, BASIS_SOURCE, source, (N_MODES, BOX_QUANTILE, FIRST_MODE_MAX) if BASIS_SOURCE == "build" else ())
+    return (BASIS, BASIS_SOURCE, source, (CHEB_BAND, CHEB_N_COEFFS, CHEB_MARGIN, CHEB_MIN_SPAN, CHEB_BOX_SCALE)
+            if BASIS_SOURCE == "build" else (), CHEB_Y_RANGE)
+
+
+def comparison_settings(statistic, sources, with_basis=True):
+    # What a saved comparison must match to be resumed. with_basis=False is the string of files saved before the
+    # basis entered it; those were all made with Lorenzo's SVD file and still load with it.
     stat = (P, WINDOW_ALPHA, MASK) if statistic == "fresnel" else (H_BAND, H_WINDOWS, H_DELAY_STEP, H_NORMALIZATION,
                                                                      H_WINDOW_ALPHA)
     budget = search_budget(**COMPARE_BUDGET)
-    return repr((statistic, stat, np.round(sources, 10).tolist(), COMPARE_SNRS, COMPARE_N_SEEDS, COMPARE_N_NOISE,
-                 COMPARE_SEED, list(DURATIONS), T_SFT, T_DATA, N_INITIAL, budget["n_population"],
-                 budget["n_steps"], budget["patience"],
-                 MIN_IMPROVEMENT, LEARNING_RATE, F_RANGE, P_ELITISM, F0_RANGE))
+    items = (statistic, stat, np.round(sources, 10).tolist(), COMPARE_SNRS, COMPARE_N_SEEDS, COMPARE_N_NOISE,
+             COMPARE_SEED, list(DURATIONS), T_SFT, T_DATA, N_INITIAL, budget["n_population"],
+             budget["n_steps"], budget["patience"],
+             MIN_IMPROVEMENT, LEARNING_RATE, F_RANGE, P_ELITISM, F0_RANGE)
+    return repr(items + ((basis_settings(),) if with_basis else ()))
+
+
+def accepted_settings(statistic, sources):
+    # The settings strings a saved file may carry to be resumed.
+    accepted = {comparison_settings(statistic, sources)}
+    if BASIS == "svd" and BASIS_SOURCE == "file" and BASIS_FILE.endswith("new_svd_basis_Tsft50000.0_cut20.npz"):
+        accepted.add(comparison_settings(statistic, sources, with_basis=False))
+    return accepted
 
 
 def save_atomic(path, **arrays):
@@ -1012,9 +1121,10 @@ def save_atomic(path, **arrays):
 def run_comparison(statistic, sources):
     path = os.path.join(RESULTS_DIR, f"compare_{COMPARE_SCALE}_{statistic}.npz")
     settings = comparison_settings(statistic, sources)
+    accepted = accepted_settings(statistic, sources)
     if COMPARE_RESUME and os.path.exists(path):
         saved = dict(np.load(path))
-        if str(saved.get("settings")) == settings:
+        if str(saved.get("settings")) in accepted:
             print(f"[{statistic}] loaded {path}")
             return saved
         print(f"[{statistic}] {path} was made with other settings: rerunning")
@@ -1028,7 +1138,7 @@ def run_comparison(statistic, sources):
     partial = path.replace(".npz", ".partial.npz")
     if COMPARE_RESUME and os.path.exists(partial):
         saved = dict(np.load(partial))
-        if str(saved["settings"]) == settings:
+        if str(saved["settings"]) in accepted:
             X, best_f, background = saved["X"], saved["best_f"], saved["background"]
             done_inj, done_noise = saved["done_inj"], saved["done_noise"]
             steps = saved["iterations"].tolist()

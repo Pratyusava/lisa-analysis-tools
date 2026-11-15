@@ -5,7 +5,7 @@
 # `make test-all` runs the whole unittest suite.
 
 PYTHON ?= python
-CHECKED := src/lisatools/search tests/test_emri_search.py
+CHECKED := src/lisatools/search src/lisatools/sources/emri/chebyshevwave.py tests/test_emri_search.py
 TESTS := tests.test_emri_search
 
 .PHONY: check format lint typecheck test test-all

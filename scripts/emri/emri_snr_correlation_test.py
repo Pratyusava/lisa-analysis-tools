@@ -288,10 +288,12 @@ plt.close(fig)
 #
 # The Chebyshev parametrisation (lisatools.sources.emri.chebyshevwave) gives
 # t(f) on a log-f grid in [fmin, fmax] from 5 coefficients alpha_0..alpha_4.
-# It's normalised so t = 0 at the geometric mean fmid; downstream we shift it
-# so the signal starts at t = 0 in the data window.  Following dev_emri_search,
-# the natural-unit output is rescaled by ``CHEB_T_SCALE`` seconds and the
-# amplitude envelope is the chirp-like (t_end - t)^(-1/4).
+# It's normalised so t = 0 at the geometric mean fmid, in seconds; downstream we
+# shift it so the signal starts at t = 0 in the data window. The ``t_scale``
+# multiplier is kept as a sanity check (it should fit to ~1; an earlier version
+# of ChebyshevWave omitted a factor 1 / f_mid, which dev_emri_search.py
+# compensated with a hardcoded 600.0) and the amplitude envelope is the
+# chirp-like (t_end - t)^(-1/4).
 #
 # We fit *one* template (a 1-D real time series, not TDI-projected) against
 # the A channel of the AET injection — see dev_emri_search.py for the same
@@ -316,8 +318,8 @@ CHEB_FMAX = float(fd_full[_ind_max])
 cheb_wave = ChebyshevWave(CHEB_NPTS, CHEB_FMIN, CHEB_FMAX)
 
 # 6-parameter search box: 5 chebyshev alphas + 1 overall t-scale on the
-# chebyshev t output. Alpha ranges copied from dev_emri_search.py; the
-# t_scale bracket is centred on dev_emri_search's hardcoded 600.0.
+# chebyshev t output (in seconds; t_scale is degenerate with alpha_0 and
+# should fit to ~1). Alpha ranges copied from dev_emri_search.py.
 ALPHA_BOUNDS = [
     (10.6,    11.7),
     (-0.97,  -0.66),
@@ -325,18 +327,18 @@ ALPHA_BOUNDS = [
     (-0.0041, +0.0018),
     (-0.0010, +0.0003),
 ]
-T_SCALE_BOUND  = (200.0, 2000.0)
+T_SCALE_BOUND  = (0.5, 2.0)
 PARAM_BOUNDS   = ALPHA_BOUNDS + [T_SCALE_BOUND]
 N_ALPHA        = len(ALPHA_BOUNDS)
-T_SCALE_DEFAULT = 600.0
+T_SCALE_DEFAULT = 1.0
 
 
 def make_chebyshev_template(alpha, N_out, dt, cheb_wave, t_scale=T_SCALE_DEFAULT):
     """Return a length-``N_out`` real time-domain template ``sin(phase) * env``.
 
     ``alpha`` is the 5-element Chebyshev coefficient vector. ``t_scale`` is an
-    overall multiplier on the chebyshev t(f) output (the empirical 600.0 from
-    dev_emri_search.py is the default).
+    overall multiplier on the chebyshev t(f) output in seconds (1.0 by default;
+    kept as a sanity check, it is degenerate with ``alpha_0``).
 
     Returns ``None`` if the supplied ``(alpha, t_scale)`` produces a
     non-monotonic t(f) or a track that does not fit in the data window.

@@ -613,8 +613,10 @@ class SVDBasisBuildTest(unittest.TestCase):
         T_ref = 0.1 * YRSID_SI
         t = np.arange(0.0, T_ref, T_SFT)  # 64 samples; the last segment ends after T_ref
         prior = {"log10_m1": (6.0, 6.3), "m2": (10.0, 30.0), "a": (0.3, 0.9), "e_f": (0.0, 0.1)}
-        tracks, params = few_track_bank(prior, 3, t, T_ref, seed=5)
+        bank = few_track_bank(prior, 3, t, T_ref, seed=5)
+        tracks, fdots, params = bank.f, bank.fdot, bank.params
         self.assertEqual(tracks.shape, (3, t.size))
+        self.assertEqual(fdots.shape, (3, t.size))
         self.assertEqual(params.shape, (3, 4))
         self.assertTrue(np.all(tracks[:, 0] > 0.0))
         self.assertTrue(np.all(tracks[:, t + T_SFT > T_ref] == 0.0))
@@ -623,16 +625,272 @@ class SVDBasisBuildTest(unittest.TestCase):
         self.assertTrue(np.all((params >= lo) & (params <= hi)))
         # The kept draws, recomputed one by one, give the same tracks.
         model = FEWHarmonicTrackModel(t, m=2, n=0)
-        for f, (log10_m1, m2, a, e_f) in zip(tracks, params):
-            ref = model((10**log10_m1, m2, a, T_ref / YRSID_SI, e_f)).f
-            ref[t + T_SFT > T_ref] = 0.0
-            np.testing.assert_array_equal(f, ref)
-        again, _ = few_track_bank(prior, 3, t, T_ref, seed=5)
-        np.testing.assert_array_equal(again, tracks)
+        for f, fdot, (log10_m1, m2, a, e_f) in zip(tracks, fdots, params):
+            ref = model((10**log10_m1, m2, a, T_ref / YRSID_SI, e_f))
+            ref_f, ref_fdot = np.array(ref.f), np.array(ref.fdot)
+            ref_f[t + T_SFT > T_ref] = 0.0
+            ref_fdot[t + T_SFT > T_ref] = 0.0
+            np.testing.assert_array_equal(f, ref_f)
+            np.testing.assert_array_equal(fdot, ref_fdot)
+        again = few_track_bank(prior, 3, t, T_ref, seed=5)
+        np.testing.assert_array_equal(again.f, tracks)
         basis = SVDBasis.build(tracks, n_modes=2, box_quantile=0.0, first_mode_max=True)
         self.assertEqual((basis.n_modes, basis.n_samples), (2, t.size))
         with self.assertRaises(RuntimeError):
             few_track_bank(prior, 3, t, T_ref, seed=5, max_draws=0)
+
+
+class ChebyshevTest(unittest.TestCase):
+    """Cutler & Bustamante-Rosell's Chebyshev phase model as a track model."""
+
+    BAND = (3e-3, 8e-3)
+
+    def setUp(self):
+        from lisatools.search.emri import ChebyshevBasis, ChebyshevTrackModel
+
+        self.t = np.arange(N_SEG) * T_SFT
+        # alpha_0 in [8, 11]: fdot = f_mid^2 e^-alpha_0 between 4e-10 and 8e-9 Hz/s
+        lb = np.array([8.0, -0.5, -0.3, -0.2, -0.1])
+        ub = np.array([11.0, 0.5, 0.3, 0.2, 0.1])
+        self.basis = ChebyshevBasis(lb, ub, band=self.BAND)
+        self.model = ChebyshevTrackModel(
+            self.basis, self.t, T_ref=N_SEG * T_SFT, force_backend="cpu"
+        )
+        self.long_t = np.arange(400) * T_SFT
+        self.long_model = ChebyshevTrackModel(self.basis, self.long_t, T_ref=200 * T_SFT)
+
+    def test_chebyshev_u_matches_scipy(self):
+        from scipy.special import eval_chebyu
+
+        from lisatools.sources.emri.chebyshevwave import chebyshev_u
+
+        y = np.linspace(-1.0, 1.0, 11)
+        U = chebyshev_u(y, 6)
+        self.assertEqual(U.shape, (6, 11))
+        for i in range(6):
+            np.testing.assert_allclose(U[i], eval_chebyu(i, y), rtol=1e-12, atol=1e-12)
+
+    def test_band_mapping(self):
+        b = self.basis
+        np.testing.assert_allclose(b.y(np.array(self.BAND)), [-1.0, 1.0])
+        np.testing.assert_allclose(b.f(np.array([-1.0, 0.0, 1.0])), [3e-3, b.f_mid, 8e-3])
+        self.assertAlmostEqual(b.kappa, 0.4904146, places=6)  # the draft's value for 3-8 mHz
+
+    def test_constant_coefficient_is_a_linear_chirp(self):
+        # alpha = (a0, 0, ...): Lambda = e^a0, fdot = f_mid^2 e^-a0 constant; anchored at
+        # f(T_ref) = f(y_ref); samples before the track enters the band are zero.
+        b, m = self.basis, self.model
+        alpha, y_ref = np.array([10.0, 0.0, 0.0, 0.0, 0.0]), -0.4
+        track = m(m.unit(alpha, y_ref))
+        fdot = b.f_mid**2 * np.exp(-10.0)
+        expected = b.f(y_ref) + fdot * (self.t - m.T_ref)
+        inside = (expected >= self.BAND[0]) & (expected <= self.BAND[1])
+        self.assertTrue(0 < inside.sum() < N_SEG)  # enters the band inside the stream
+        np.testing.assert_allclose(track.f, np.where(inside, expected, 0.0), rtol=1e-8, atol=0)
+        np.testing.assert_allclose(track.fdot, np.where(inside, fdot, 0.0), rtol=1e-8, atol=0)
+        # leaving the band at the top, on the long grid
+        m2 = self.long_model
+        track = m2(m2.unit(alpha, 0.0))
+        expected = b.f_mid + fdot * (self.long_t - m2.T_ref)
+        inside = (expected >= self.BAND[0]) & (expected <= self.BAND[1])
+        self.assertTrue(inside[0] == 0 and inside[-1] == 0 and inside.any())
+        np.testing.assert_allclose(track.f, np.where(inside, expected, 0.0), rtol=1e-8, atol=0)
+
+    def test_shift_moves_the_anchor(self):
+        xi = np.random.default_rng(2).uniform(0.2, 0.8, self.model.ndim)
+        shifted, plain = self.model(xi, shift=-3), self.model(xi)
+        np.testing.assert_allclose(shifted.f[:-3], plain.f[3:], rtol=1e-9, atol=0)
+        self.assertEqual(self.model.shift_for_plunge(21 * T_SFT), -3)
+        self.assertEqual(self.model.frequency_range(), self.BAND)
+
+    def test_fit_round_trip(self):
+        from lisatools.sources.emri.chebyshevwave import chebyshev_fit
+
+        m = self.long_model
+        xi = np.random.default_rng(0).uniform(0.5, 0.8, m.ndim)
+        xi[-1] = 0.5
+        alpha, _ = m.coeffs(xi)
+        track = m(xi)
+        fit, span, rms = chebyshev_fit(track.f, track.fdot, self.BAND, 5)
+        np.testing.assert_allclose(fit, alpha, rtol=0, atol=1e-5)
+        self.assertGreater(span, 1.9)
+        self.assertLess(rms, 1e-5)
+        nan, span0, _ = chebyshev_fit(np.zeros(10), np.zeros(10), self.BAND, 5)
+        self.assertTrue(np.all(np.isnan(nan)) and span0 == 0.0)
+
+    def test_basis_fit_box(self):
+        import tempfile
+
+        from lisatools.search.emri import ChebyshevBasis
+
+        m = self.long_model
+        rng = np.random.default_rng(1)
+        xis = rng.uniform(0.5, 0.8, (6, m.ndim))
+        xis[:, -1] = 0.5
+        f = np.array([m(x).f for x in xis])
+        fdot = np.array([m(x).fdot for x in xis])
+        alphas = np.array([m.coeffs(x)[0] for x in xis])
+        fitted = ChebyshevBasis.fit(f, fdot, n_coeffs=5, band=self.BAND, margin=0.2)
+        lo, hi = alphas.min(axis=0), alphas.max(axis=0)
+        self.assertEqual(fitted.fits.shape, (6, 5))
+        np.testing.assert_allclose(fitted.lb, lo - 0.2 * (hi - lo), atol=1e-4)
+        np.testing.assert_allclose(fitted.ub, hi + 0.2 * (hi - lo), atol=1e-4)
+        wide = ChebyshevBasis.fit(f, fdot, band=self.BAND, scale=10.0)
+        np.testing.assert_allclose(wide.ub - wide.lb, 10 * (fitted.ub - fitted.lb))
+        np.testing.assert_allclose(wide.ub + wide.lb, fitted.ub + fitted.lb)
+        # a track covering only the lower half of the band fails the span cut
+        lower = f[0] < self.basis.f_mid
+        f2 = np.array([f[0], np.where(lower, f[0], 0.0)])
+        fdot2 = np.array([fdot[0], np.where(lower, fdot[0], 0.0)])
+        self.assertEqual(ChebyshevBasis.fit(f2, fdot2, band=self.BAND).fits.shape[0], 1)
+        self.assertEqual(
+            ChebyshevBasis.fit(f2, fdot2, band=self.BAND, min_span=0.5).fits.shape[0], 2
+        )
+        with self.assertRaises(ValueError):
+            ChebyshevBasis.fit(f2[1:], fdot2[1:], band=self.BAND)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "cheb.npz")
+            wide.save_npz(path)
+            back = ChebyshevBasis.from_npz(path)
+            svd_path = os.path.join(d, "svd.npz")
+            SVDBasis.build(f, 2).save_npz(svd_path)
+            with self.assertRaises(ValueError):
+                ChebyshevBasis.from_npz(svd_path)
+        np.testing.assert_array_equal(back.lb, wide.lb)
+        np.testing.assert_array_equal(back.ub, wide.ub)
+        np.testing.assert_array_equal(back.fits, wide.fits)
+        self.assertEqual(back.band, self.BAND)
+
+    # Curt Cutler's catalogue entry "set1" of scripts/emri/emri_chebyshev_comparison.py: the
+    # source and the first five of its nine fitted coefficients.
+    CURT_SET1 = dict(
+        m1=6.87546892e05, m2=2.01552295e01, a=8.97791738e-01, p0=1.02313998e01, e0=4.67444363e-01
+    )
+    CURT_ALPHA1 = np.array(
+        [1.10514090e01, -7.36439420e-01, -3.00210231e-02, 1.25810088e-03, 1.77557571e-04]
+    )
+
+    def test_cumulative_simpson_matches_scipy(self):
+        from scipy.integrate import cumulative_simpson as reference
+
+        from lisatools.sources.emri.chebyshevwave import cumulative_simpson
+
+        rng = np.random.default_rng(0)
+        for n in (5001, 5000, 7, 8, 3):
+            y = rng.normal(size=(3, n))
+            want = reference(y, dx=0.1, initial=0, axis=-1)
+            np.testing.assert_allclose(cumulative_simpson(y, 0.1), want, rtol=1e-12, atol=1e-12)
+            np.testing.assert_allclose(
+                cumulative_simpson(y[0], 0.1), want[0], rtol=1e-12, atol=1e-12
+            )
+            if HAVE_JAX:
+                got = cumulative_simpson(jnp.asarray(y), 0.1, jnp)
+                np.testing.assert_allclose(np.asarray(got), want, rtol=1e-12, atol=1e-12)
+        with self.assertRaises(ValueError):
+            cumulative_simpson(np.ones(2), 0.1)
+
+    def test_chebyshevwave_is_the_model(self):
+        # The track model evaluates lisatools.sources.emri.chebyshevwave.ChebyshevWave (one
+        # implementation): its legacy call, one coefficient per argument, returns t in seconds
+        # with t = 0 at f_mid, for one or a batch of coefficient sets.
+        from lisatools.sources.emri.chebyshevwave import ChebyshevWave
+
+        wave = ChebyshevWave(self.model.n_y, *self.BAND)
+        self.assertIsInstance(self.model.wave, ChebyshevWave)
+        t_cw, f_cw = wave(*self.CURT_ALPHA1)
+        t, f, fdot = self.model.grid(self.CURT_ALPHA1, 0.0, 0.0)  # anchor y_ref = 0 at T = 0
+        np.testing.assert_allclose(f, f_cw, rtol=1e-12)
+        np.testing.assert_allclose(t, t_cw, rtol=1e-12, atol=1e-6)
+        self.assertAlmostEqual(float(np.interp(wave.fmid, f_cw, t_cw)), 0.0, places=6)
+        # dt/df = Lambda / f_mid^2 along the grid (interior points: central differences)
+        np.testing.assert_allclose(np.gradient(t_cw, f_cw)[1:-1], 1 / fdot[1:-1], rtol=1e-4)
+        # a batch, one array per coefficient
+        batch = np.stack([self.CURT_ALPHA1, self.CURT_ALPHA1 + [0.1, 0, 0, 0, 0]])
+        t_b, f_b = wave(*batch.T)
+        self.assertEqual(t_b.shape, (2, wave.npts))
+        np.testing.assert_allclose(t_b[0], t_cw, rtol=1e-12, atol=1e-6)
+        np.testing.assert_allclose(t_b[1], t_cw * np.exp(0.1), rtol=1e-12, atol=1e-6)
+        phase, _ = wave(*batch.T, return_phase=True)
+        np.testing.assert_allclose(phase, 2 * np.pi * t_b * f_b, rtol=1e-12)
+        with self.assertRaises(ValueError):
+            wave(*self.CURT_ALPHA1[:4])
+        # the search's anchor: t = 0 at y_ref, also for a batch of (alpha, y_ref)
+        t_ref, _, _ = wave.track(batch, y_ref=np.array([0.3, -0.7]))
+        for row, y_ref in zip(t_ref, [0.3, -0.7]):
+            self.assertAlmostEqual(float(np.interp(y_ref, wave.y, row)), 0.0, places=6)
+
+    def test_fit_reproduces_the_drafts_catalogue(self):
+        # A five-coefficient fit of the FEW m=2 track of Curt's source gives his coefficients
+        # (his are the first five of a nine-coefficient fit, so the last two agree less well).
+        try:
+            from few.trajectory.inspiral import EMRIInspiral
+            from few.trajectory.ode import KerrEccEqFlux
+        except ImportError:  # pragma: no cover
+            raise unittest.SkipTest("FEW not installed")
+        from scipy.interpolate import CubicSpline
+
+        from lisatools.sources.emri.chebyshevwave import chebyshev_fit
+
+        src = self.CURT_SET1
+        t, _p, _e, _x, Phi_phi, *_ = EMRIInspiral(func=KerrEccEqFlux)(
+            src["m1"], src["m2"], src["a"], src["p0"], src["e0"], 1.0, T=1.0, dt=10.0
+        )
+        spl = CubicSpline(np.asarray(t), np.asarray(Phi_phi))
+        tf = np.linspace(t[0], t[-1], 100_001)
+        f, fdot = spl(tf, 1) / np.pi, spl(tf, 2) / np.pi  # m = 2: 2 dPhi/dt / 2 pi
+        alpha, span, _rms = chebyshev_fit(f, fdot, self.BAND, 5)
+        self.assertGreater(span, 1.99)
+        np.testing.assert_allclose(alpha[:3], self.CURT_ALPHA1[:3], rtol=2e-3)
+        np.testing.assert_allclose(alpha[3:], self.CURT_ALPHA1[3:], atol=2e-4)
+
+    def test_search_with_chebyshev_model(self):
+        # A linear chirp in the band, searched with the Fresnel statistic over the 6-coordinate cube
+        # The true point is in the population, so the (greedy) search ends at least as high as it.
+        if not HAVE_JAX:
+            raise unittest.SkipTest("JAX not installed")
+        from lisatools.search.emri import ChebyshevTrackModel
+
+        psd = toy_psd()
+        fdot = 1e-9
+        track = chirp_track(f0=4e-3, fdot=fdot)  # 4.0 -> 5.2 mHz over the stream
+        n = int(N_SEG * T_SFT / DT)
+        amp = 40 * np.sqrt(psd(np.array([4.5e-3]))[0] / (N_SEG * T_SFT / 2))
+        np.random.seed(4)
+        x = chirp_timeseries(track, amp) + gaussian_noise(n, DT, psd)[0]
+        data = SFTData.from_timeseries(x, DT, T_SFT, psd)
+        stat = FresnelStatistic.for_data(data, force_backend="jax")
+        model = ChebyshevTrackModel(
+            self.basis, data.t_alpha, T_ref=N_SEG * T_SFT, force_backend="jax"
+        )
+        search = EMRISearch(data, stat, model, AdamDE(n_steps=3, save_every=5), n_population=8)
+        alpha_true = np.array([np.log(self.basis.f_mid**2 / fdot), 0.0, 0.0, 0.0, 0.0])
+        y_true = self.basis.y(4e-3 + fdot * N_SEG * T_SFT)
+        xi_true = model.unit(alpha_true, y_true)
+        self.assertTrue(np.all((xi_true > 0) & (xi_true < 1)))
+        arr = stat.prepare(data)
+        s_true = float(stat.evaluate(arr, model(jnp.asarray(xi_true))))
+        self.assertGreater(s_true, 100.0)  # the injection is found on its own track
+        x0 = np.vstack([model.initial_population(7, seed=0), xi_true])
+        result = search.run(T_pl=N_SEG * T_SFT, seed=0, x0=jnp.asarray(x0))
+        self.assertGreaterEqual(result.best_statistic, s_true - 1e-6)
+        self.assertEqual(result.best_x.shape, (model.ndim,))
+        self.assertEqual(np.asarray(result.best_track.f).shape, (N_SEG,))
+
+    def test_jax_matches_numpy_and_grad(self):
+        if not HAVE_JAX:
+            raise unittest.SkipTest("JAX not installed")
+        from lisatools.search.emri import ChebyshevTrackModel
+
+        mj = ChebyshevTrackModel(self.basis, self.t, T_ref=N_SEG * T_SFT, force_backend="jax")
+        xi = np.random.default_rng(3).uniform(0.2, 0.8, mj.ndim)
+        a, b = self.model(xi), mj(jnp.asarray(xi))
+        np.testing.assert_allclose(np.asarray(b.f), a.f, rtol=1e-12, atol=0)
+        np.testing.assert_allclose(np.asarray(b.fdot), a.fdot, rtol=1e-12, atol=0)
+        g = jax.grad(lambda x: jnp.sum(mj(x).f))(jnp.asarray(xi))
+        self.assertTrue(np.all(np.isfinite(g)) and np.any(np.asarray(g) != 0))
+        pop = mj.initial_population(8, seed=0)
+        self.assertEqual(pop.shape, (8, mj.ndim))
+        self.assertTrue(np.all((pop >= 0) & (pop <= 1)))
 
 
 class ShiftTest(unittest.TestCase):

@@ -4,8 +4,10 @@ Re-implements the search of Speri, Tenorio, Chapman-Bird & Gerosa (2026,
 arXiv:2510.20891; github.com/lorenzosp/EMRI-Search) on LAT, split into
 swappable parts: data containers (:mod:`.data`), injections
 (:mod:`.injection`), PSD (:mod:`.psd`), frequency-track models
-(:mod:`.tracks`), statistics (semi-coherent in :mod:`.statistic` with kernels
-in :mod:`.kernels`; coherent delay-scanning, incl. Cutler &
+(:mod:`.tracks`: SVD bases, Cutler & Bustamante-Rosell's Chebyshev model
+from :mod:`lisatools.sources.emri.chebyshevwave`, FEW tracks), statistics
+(semi-coherent in :mod:`.statistic` with kernels in :mod:`.kernels`;
+coherent delay-scanning, incl. Cutler &
 Bustamante-Rosell's ``H``, in :mod:`.excess_power`), optimisers
 (:mod:`.optimize`) and the driver (:mod:`.pipeline`).
 """
@@ -38,10 +40,13 @@ from .statistic import (  # noqa: F401
     Statistic,
 )
 from .tracks import (  # noqa: F401
+    ChebyshevBasis,
+    ChebyshevTrackModel,
     FEWHarmonicTrackModel,
     SVDBasis,
     SVDTrackModel,
     Track,
+    TrackBank,
     backward_inspiral,
     few_track_bank,
     kerr_ecc_eq_inspiral,

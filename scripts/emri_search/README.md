@@ -2,7 +2,7 @@
 
 The modular semi-coherent EMRI search (`lisatools.search.emri`) and its walkthrough notebook
 `emri_search_lorenzo.ipynb` (Lorenzo Speri's search, arXiv:2510.20891, plus Cutler &
-Bustamante-Rosell's `H` statistic). Everything runs on the CPU with JAX.
+Bustamante-Rosell's `H` statistic and Chebyshev track model). Everything runs on the CPU with JAX.
 
 | File | What it is |
 |---|---|
@@ -79,8 +79,9 @@ jupyter lab emri_search_lorenzo.ipynb
 - Results go to `results_toy/` (or `results_paper/`) next to the notebook; git ignores them.
 - Inputs are in Sec. 1: the toy values are active, the paper's (`# PAPER:`), Lorenzo's repo's
   (`# REPO:`) and the Cutler & Bustamante-Rosell draft's (`# CB-R draft:`) are commented next to
-  each one. `STATISTIC` picks `"fresnel"` (Lorenzo) or `"H"`; `BASIS_SOURCE` picks `"file"` (Lorenzo's basis,
-  or an `.npz` saved by a build) or `"build"` (the SVD of a FEW track bank with the Sec. 1d inputs, saved to
+  each one. `STATISTIC` picks `"fresnel"` (Lorenzo) or `"H"`; `BASIS` picks `"svd"` (Lorenzo's SVD basis of FEW
+  tracks) or `"chebyshev"` (Cutler & Bustamante-Rosell's phase model); `BASIS_SOURCE` picks `"file"` (Lorenzo's
+  basis, or an `.npz` saved by a build) or `"build"` (from a FEW track bank with the Sec. 1d inputs, saved to
   `BASIS_SAVE`).
 
 Long runs (e.g. the Sec. 10 statistic comparison), headless and with the Mac kept awake:

@@ -3,8 +3,8 @@
 A track is the frequency evolution of one harmonic sampled at the SFT segment
 starts: ``f_alpha``, ``fdot_alpha`` and optionally ``fddot_alpha``. A track
 model maps search parameters to a :class:`Track`; the statistic only ever sees
-the :class:`Track`, so models (physical FEW trajectories, SVD bases, ...) swap
-freely.
+the :class:`Track`, so models (physical FEW trajectories, SVD bases, Cutler &
+Bustamante-Rosell's Chebyshev phase model, ...) swap freely.
 """
 
 from typing import Any, NamedTuple, Optional
@@ -24,6 +24,14 @@ class Track(NamedTuple):
     f: Any
     fdot: Any
     fddot: Optional[Any] = None
+
+
+class TrackBank(NamedTuple):
+    """A bank of harmonic tracks on one grid (:func:`few_track_bank`)."""
+
+    f: np.ndarray  # (n_tracks, n_samples) [Hz]
+    fdot: np.ndarray  # (n_tracks, n_samples) [Hz/s]
+    params: np.ndarray  # (n_tracks, 4): the draws (log10 m1, m2, a, e_f)
 
 
 class SVDBasis:
@@ -288,8 +296,8 @@ def few_track_bank(prior, n_tracks, t_alpha, T_ref, seed=None, m=2, n=0, err=1e-
         m, n, err: Harmonic and integrator tolerance (:class:`FEWHarmonicTrackModel`).
 
     Returns:
-        ``(tracks, params)``: the tracks, shape ``(n_tracks, len(t_alpha))`` [Hz],
-        and the kept draws, shape ``(n_tracks, 4)``.
+        A :class:`TrackBank`: ``f`` and ``fdot``, shape ``(n_tracks, len(t_alpha))``,
+        and the kept draws ``params``, shape ``(n_tracks, 4)``.
     """
     from ...utils.constants import YRSID_SI
 
@@ -302,7 +310,7 @@ def few_track_bank(prior, n_tracks, t_alpha, T_ref, seed=None, m=2, n=0, err=1e-
     model = FEWHarmonicTrackModel(t_alpha, m=m, n=n, err=err)
     rng = np.random.default_rng(seed)
     max_draws = 20 * n_tracks if max_draws is None else int(max_draws)
-    tracks, params, draws = [], [], 0
+    tracks, fdots, params, draws = [], [], [], 0
     while len(tracks) < n_tracks:
         if draws >= max_draws:
             raise RuntimeError(
@@ -312,15 +320,18 @@ def few_track_bank(prior, n_tracks, t_alpha, T_ref, seed=None, m=2, n=0, err=1e-
         draws += 1
         log10_m1, m2, a, e_f = rng.uniform(lo, hi)
         try:
-            f = model((10**log10_m1, m2, a, T_ref / YRSID_SI, e_f)).f
+            track = model((10**log10_m1, m2, a, T_ref / YRSID_SI, e_f))
         except Exception:  # FEW cannot integrate this draw back to t_alpha[0]
             continue
+        f, fdot = np.array(track.f), np.array(track.fdot)
         if f[0] == 0.0:  # the inspiral is shorter than the grid
             continue
         f[incomplete] = 0.0
+        fdot[incomplete] = 0.0
         tracks.append(f)
+        fdots.append(fdot)
         params.append((log10_m1, m2, a, e_f))
-    return np.array(tracks), np.array(params)
+    return TrackBank(np.array(tracks), np.array(fdots), np.array(params))
 
 
 def kerr_ecc_eq_inspiral():
@@ -345,6 +356,221 @@ def backward_inspiral(traj, m1, m2, a, T_pl, e_f, x_f=1.0, err=1e-11):
 
     p_f = traj.inspiral_generator.func.separatrix_buffer_dist + get_separatrix(a, e_f, x_f) + 1e-6
     return traj(m1, m2, a, p_f, e_f, x_f, T=T_pl, integrate_backwards=True, err=err)
+
+
+class ChebyshevBasis:
+    """The coefficient box of Cutler & Bustamante-Rosell's Chebyshev phase model.
+
+    The model itself, ``ln Lambda(y) = sum_i alpha_i U_i(y)`` over a band mapped
+    to ``y`` in [-1, 1], is :mod:`lisatools.sources.emri.chebyshevwave`
+    (:class:`~lisatools.sources.emri.chebyshevwave.ChebyshevWave` evaluates
+    ``t(f)``, :func:`~lisatools.sources.emri.chebyshevwave.chebyshev_fit` fits a
+    track). This class holds the search's box ``[lb, ub]`` of coefficients, which
+    :meth:`fit` derives from a bank of physical tracks as the draft does (the
+    accepted fits' range with a margin, optionally widened about its centre);
+    :class:`ChebyshevTrackModel` turns a point of the box into a track.
+
+    Args:
+        lb, ub: Coefficient box, shape ``(n_coeffs,)``.
+        band: ``(f_min, f_max)`` [Hz] (draft: 3-8 mHz).
+        fits: The accepted catalogue fits the box was made from (diagnostic).
+    """
+
+    def __init__(self, lb, ub, band=(3e-3, 8e-3), fits=None):
+        from ...sources.emri.chebyshevwave import band_scales
+
+        self.lb = np.asarray(lb, dtype=float)
+        self.ub = np.asarray(ub, dtype=float)
+        self.band = (float(band[0]), float(band[1]))
+        self.f_mid, self.kappa = band_scales(*self.band)
+        self.fits = None if fits is None else np.asarray(fits, dtype=float)
+        if self.lb.shape != self.ub.shape or self.lb.ndim != 1:
+            raise ValueError("lb and ub must be 1-d arrays of the same length.")
+
+    @property
+    def n_coeffs(self) -> int:
+        return self.lb.size
+
+    def y(self, f):
+        """Frequency [Hz] -> ``y``."""
+        return np.log(np.asarray(f, dtype=float) / self.f_mid) / self.kappa
+
+    def f(self, y):
+        """``y`` -> frequency [Hz]."""
+        return self.f_mid * np.exp(self.kappa * np.asarray(y, dtype=float))
+
+    def frequency_range(self):
+        """The band: every track is zero outside it."""
+        return self.band
+
+    @classmethod
+    def fit(
+        cls,
+        f,
+        fdot,
+        n_coeffs=5,
+        band=(3e-3, 8e-3),
+        margin=0.2,
+        min_span=1.9,
+        rms_max=None,
+        scale=1.0,
+    ):
+        """The box of a bank of tracks (e.g. :func:`few_track_bank`), as the draft's
+        catalogue box: each track's coefficients from
+        :func:`~lisatools.sources.emri.chebyshevwave.chebyshev_fit`; fits are
+        kept when they span at least ``min_span`` of the band's width 2 in
+        ``y``, have ``alpha_0 > 0`` and (if ``rms_max``) an rms residual below
+        it; the box is the kept coefficients' range widened by ``margin`` of
+        that range at each end, then by ``scale`` about its centre (the draft's
+        wide box is ``scale=10``).
+
+        Args:
+            f, fdot: Tracks, shape ``(n_tracks, n_samples)`` (zeros outside the inspiral).
+        """
+        from ...sources.emri.chebyshevwave import chebyshev_fit
+
+        fits = []
+        for fi, fdi in zip(np.asarray(f, dtype=float), np.asarray(fdot, dtype=float)):
+            alpha, span, rms = chebyshev_fit(fi, fdi, band, n_coeffs)
+            if np.all(np.isfinite(alpha)) and span >= min_span and alpha[0] > 0.0:
+                if rms_max is None or rms <= rms_max:
+                    fits.append(alpha)
+        if not fits:
+            raise ValueError("no track passed the catalogue cuts (band coverage, alpha_0 > 0).")
+        fits = np.array(fits)
+        lo, hi = fits.min(axis=0), fits.max(axis=0)
+        lb, ub = lo - margin * (hi - lo), hi + margin * (hi - lo)
+        centre, half = 0.5 * (lb + ub), 0.5 * scale * (ub - lb)
+        return cls(centre - half, centre + half, band=band, fits=fits)
+
+    @classmethod
+    def from_npz(cls, path):
+        d = np.load(path, allow_pickle=True)
+        if "cheb_lb" not in d.files:
+            raise ValueError(f"{path} is not a Chebyshev basis file (no 'cheb_lb').")
+        fits = d["cheb_fits"] if "cheb_fits" in d.files and d["cheb_fits"].size else None
+        return cls(d["cheb_lb"], d["cheb_ub"], band=tuple(d["band"]), fits=fits)
+
+    def save_npz(self, path):
+        np.savez(
+            path,
+            cheb_lb=self.lb,
+            cheb_ub=self.ub,
+            band=np.array(self.band),
+            cheb_fits=self.fits if self.fits is not None else np.zeros((0, self.n_coeffs)),
+        )
+
+
+class ChebyshevTrackModel(LISAToolsParallelModule):
+    """Track = a :class:`ChebyshevBasis` point, placed by its frequency at the end of the stream.
+
+    The unit cube has ``basis.n_coeffs + 1`` coordinates: the coefficients
+    ``alpha`` in the box, and ``y_ref`` in ``y_range``, the track's ``y`` (log
+    frequency in the band) at the anchor time ``T_ref``. A trial plunge time
+    ``T_pl`` moves the anchor by ``shift_for_plunge(T_pl)`` segments, as the SVD
+    model moves its plunge, so Lorenzo's duration scan (anchor at the end of
+    each stream) applies unchanged. The track is integrated from the anchor,
+
+        t(y) = T_anchor + (kappa / f_mid) int_{y_ref}^{y} e^{kappa v} Lambda(v) dv
+
+    (draft Eq. A1 with the integration constant at ``y_ref`` instead of 0), by
+    :class:`~lisatools.sources.emri.chebyshevwave.ChebyshevWave` on ``n_y``
+    points in ``y``, and read at the segment starts; ``fdot = f_mid^2 /
+    Lambda``. Samples before the track enters the band or after it leaves are
+    zero (the statistics' masks drop them). ``fddot`` is left to the mask's
+    differences.
+
+    Args:
+        basis: The :class:`ChebyshevBasis` (box and band).
+        t_alpha: Segment start times [s].
+        T_ref: Anchor time [s] of ``y_ref`` before any shift (the data's end).
+        y_range: Range of the anchor coordinate (default the whole band, (-1, 1)).
+        n_y: Quadrature points in ``y`` (draft: 5001).
+        force_backend: ``"cpu"`` (NumPy) or ``"jax"``.
+
+    Attributes:
+        wave: The :class:`~lisatools.sources.emri.chebyshevwave.ChebyshevWave`
+            on the same backend.
+    """
+
+    def __init__(
+        self,
+        basis: ChebyshevBasis,
+        t_alpha,
+        T_ref,
+        y_range=(-1.0, 1.0),
+        n_y=5001,
+        force_backend=None,
+    ):
+        from ...sources.emri.chebyshevwave import ChebyshevWave
+
+        super().__init__(force_backend=force_backend)
+        self.basis = basis
+        self.t_alpha = np.asarray(t_alpha, dtype=float)
+        self.T_ref = float(T_ref)
+        self.y_range = (float(y_range[0]), float(y_range[1]))
+        self.n_y = int(n_y)
+        self.wave = ChebyshevWave(
+            self.n_y,
+            basis.band[0],
+            basis.band[1],
+            n_coeffs=basis.n_coeffs,
+            force_backend=self.backend,
+        )
+
+    @classmethod
+    def supported_backends(cls):
+        return [cls._BACKEND_PREFIX + "_" + t for t in ("cpu", "jax")]
+
+    @property
+    def ndim(self) -> int:
+        return self.basis.n_coeffs + 1
+
+    @property
+    def T_sft(self) -> float:
+        return float(self.t_alpha[1] - self.t_alpha[0])
+
+    def shift_for_plunge(self, T_pl) -> int:
+        """Segment shift that moves the anchor ``T_ref`` to ``T_pl`` [s]."""
+        return int((T_pl - self.T_ref) / self.T_sft)
+
+    def frequency_range(self):
+        """The band [Hz]: tracks are zero outside it."""
+        return self.basis.band
+
+    def coeffs(self, xi):
+        """Unit-cube point -> ``(alpha, y_ref)``."""
+        xp = self.xp
+        b = self.basis
+        alpha = xp.asarray(b.lb) + xi[..., : b.n_coeffs] * xp.asarray(b.ub - b.lb)
+        y_ref = self.y_range[0] + xi[..., b.n_coeffs] * (self.y_range[1] - self.y_range[0])
+        return alpha, y_ref
+
+    def unit(self, alpha, y_ref):
+        """``(alpha, y_ref)`` -> unit-cube point."""
+        b = self.basis
+        xi_y = (np.asarray(y_ref) - self.y_range[0]) / (self.y_range[1] - self.y_range[0])
+        return np.concatenate([(np.asarray(alpha) - b.lb) / (b.ub - b.lb), np.atleast_1d(xi_y)])
+
+    def grid(self, alpha, y_ref, T_anchor):
+        """``(t, f, fdot)`` of the track on the ``y`` grid, anchored at ``t(y_ref) = T_anchor``."""
+        t, f, fdot = self.wave.track(alpha, y_ref)
+        return T_anchor + t, f, fdot
+
+    def __call__(self, xi, shift=0) -> Track:
+        xp = self.xp
+        alpha, y_ref = self.coeffs(xi)
+        t, f, fdot = self.grid(alpha, y_ref, self.T_ref + shift * self.T_sft)
+        t_alpha = xp.asarray(self.t_alpha)
+        inside = (t_alpha >= t[0]) & (t_alpha <= t[-1])
+        f_alpha = xp.where(inside, xp.interp(t_alpha, t, f), 0.0)
+        fdot_alpha = xp.where(inside, xp.interp(t_alpha, t, fdot), 0.0)
+        return Track(f_alpha, fdot_alpha)
+
+    def initial_population(self, n, seed=None):
+        """Sobol points of the unit cube (coefficients and anchor frequency)."""
+        rng = np.random.default_rng(seed)
+        return qmc.Sobol(d=self.ndim, rng=rng).random(n)
 
 
 def _roll_and_zero(f, shift, xp):

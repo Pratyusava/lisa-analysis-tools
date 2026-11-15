@@ -143,9 +143,11 @@ CHEB_FMIN_REQ = 2.0e-3
 CHEB_FMAX_REQ = 5.0e-3
 CHEB_NPTS     = 32001
 
-# t_scale scan — dev_emri_search.py hardcodes 600.0. We scan a wider range
-# per set with two refinement passes around the maximum.
-T_SCALE_COARSE  = np.linspace(50.0, 3000.0, 30)
+# t_scale scan. ChebyshevWave returns t in seconds (its earlier version omitted
+# a factor 1 / f_mid, which dev_emri_search.py compensated with a hardcoded
+# 600.0), so the scan is a sanity check around 1 with two refinement passes.
+# Note t_scale is degenerate with alpha_0 (t -> s t is alpha_0 -> alpha_0 + ln s).
+T_SCALE_COARSE  = np.linspace(0.5, 2.0, 31)
 T_SCALE_REFINE  = 21        # number of refine points around each coarse winner
 T_SCALE_REFINE2 = 21        # 2nd refinement (finer grid)
 
@@ -157,7 +159,7 @@ DE_ALPHA_BOUNDS = [
     (-0.0041, +0.0018),
     (-0.0010, +0.0003),
 ]
-DE_T_SCALE_BOUNDS = (50.0, 2000.0)
+DE_T_SCALE_BOUNDS = (0.5, 2.0)
 NM_MAXFEV      = 200      # bounded eval count for Nelder-Mead refit
 NM_PRINT_EVERY = 20
 
