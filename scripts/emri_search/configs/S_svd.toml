@@ -11,6 +11,7 @@ out = "../runs/S_svd"     # campaign directory: config.json, results/, summary.c
 n_workers = 4             # processes
 tol_bins = 2.0            # localisation tolerance of the summary [bins]
 p_fa = [0.5, 1e-2, 1e-4]  # PAPER: false-alarm probabilities of the detection thresholds
+coherence = [1, 2, 4]     # track mismatch over coherent segments of k SFT segments (1 always)
 
 [inputs]
 injections = ["../inj/*.json"]  # injection files (make_injections.py), each on the noise it records

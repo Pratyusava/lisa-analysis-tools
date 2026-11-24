@@ -370,20 +370,32 @@ class SearchConfig:
         """Segment start times of the basis tracks [s], up to the plunge at ``T_ref``."""
         return np.arange(0.0, self.basis.T_ref, self.data.T_sft)
 
-    def build_basis(self, log=print):
-        """Build the basis from a FEW track bank (``[basis.bank]``) and save it to
-        ``basis.file``. Needs FEW; ~0.25 s per bank track."""
+    def track_bank(self, log=print, n_workers=1):
+        """The FEW ``m = 2`` track bank of ``[basis.bank]`` on the basis grid. Needs FEW;
+        ~0.02 s per track (3000 in 75 s on an M3 Pro), integrated in ``n_workers`` processes
+        (the bank is the same for any number)."""
+        bank = few_track_bank(
+            self.basis.bank.prior,
+            self.basis.bank.n_tracks,
+            self.basis_grid(),
+            self.basis.T_ref,
+            self.basis.bank.seed,
+            n_workers=n_workers,
+        )
+        log(f"bank: {len(bank.f)} FEW m = 2 tracks plunging at T_ref")
+        return bank
+
+    def build_basis(self, log=print, bank=None, n_workers=1):
+        """Build the basis from a track bank and save it to ``basis.file``.
+
+        ``bank`` (a :class:`~.tracks.TrackBank` on :meth:`basis_grid`) defaults to
+        :meth:`track_bank` in ``n_workers`` processes; passing one lets several bases share it.
+        """
         settings = self.basis
         if not settings.file:
             raise ValueError("basis.file is not set (where the built basis is saved).")
-        bank = few_track_bank(
-            settings.bank.prior,
-            settings.bank.n_tracks,
-            self.basis_grid(),
-            settings.T_ref,
-            settings.bank.seed,
-        )
-        log(f"bank: {len(bank.f)} FEW m = 2 tracks plunging at T_ref")
+        if bank is None:
+            bank = self.track_bank(log, n_workers=n_workers)
 
         basis: Any
         if settings.name == "svd":
@@ -413,13 +425,13 @@ class SearchConfig:
         log(f"basis saved to {settings.file}")
         return basis
 
-    def prepare_basis(self, log=print):
+    def prepare_basis(self, log=print, n_workers=1):
         """Make sure the basis file exists (built once for ``source = "build"``) and fits the
         grid: an SVD basis must have one sample per segment before ``T_ref``."""
         if not os.path.exists(self.basis.file):
             if self.basis.source == "file":
                 raise FileNotFoundError(f"basis.file {self.basis.file!r} does not exist.")
-            self.build_basis(log=log)
+            self.build_basis(log=log, n_workers=n_workers)
         basis = self.load_basis()
         n_grid = self.basis_grid().size
         if self.basis.name == "svd" and basis.n_samples != n_grid:

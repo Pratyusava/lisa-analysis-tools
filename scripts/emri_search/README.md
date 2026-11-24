@@ -13,6 +13,7 @@ Bustamante-Rosell's `H` statistic and Chebyshev track model). Everything runs on
 | `configs/` | Campaign files: `S_svd.toml` (Speri et al.'s search), `H_chebyshev.toml` (Cutler & Bustamante-Rosell's `H` on a built Chebyshev basis), `reference.toml` (every setting, both statistics and bases) |
 | `make_injections.py` | Injection files for a campaign (FEW sources from the paper's prior), as recipes with checksums |
 | `make_noise.py` | Noise files for a campaign's background, as seeds with checksums |
+| `basis_coverage.py` | How much of the source population each track basis can represent, with no search (basis mismatch per source and variant; ~10 GB per worker, FEW's generator) |
 
 ## Setup
 
@@ -172,7 +173,24 @@ is at least as large (it resolves down to one over the number of noise files); `
 from a Gumbel fit to the noise `Lambda` (the paper's: location 1.94, scale 0.56);
 `detected_<p>` at each false-alarm probability of `p_fa` (paper: 0.5, 1e-2, 1e-4); and how well
 the best track follows the injected one. The standardisation needs at least 2 noise streams and
-the Gumbel fit 3. A directory accepts only one configuration, and reruns skip the searches whose
+the Gumbel fit 3.
+
+The track's quality is its **mismatch** (`lisatools.search.emri.mismatch`): the semi-coherent
+power the best track collects from the noiseless injected signal, against the power of the true
+track, `mismatch = 1 - P(found) / P(true)`, on one ruler for every statistic and basis. The true
+track is FEW's `m Phi_phi` harmonic closest to the found track (`harmonic`, m = 2, 3, 4: in TDI the
+m = 3 harmonic often carries a third of the power, and a single-harmonic search may lock onto it),
+and every power is taken over the longest searched stream, so a track found at too short a
+duration is charged for what it misses. It splits as
+`1 - mismatch = (1 - mismatch_basis) (1 - mismatch_search)`: `mismatch_basis` is the loss of the
+best track the basis can represent (fits of the true track inside the basis box at the scan
+durations bracketing the plunge; `in_basis_box` says whether the unbounded fit stayed in the
+box), and `mismatch_search` the loss of the found track against that one (negative when the search
+beat the fit, which is an upper bound on the basis loss). `mismatch_x<k>` uses coherent segments of
+`k` SFT segments (`coherence`, default 1, 2, 4), the question a coherent follow-up asks.
+`collect` regenerates each injection's signal with FEW once and caches the columns in
+`<out>/mismatch/`; `agreement` (the fraction of segments within `tol_bins` bins) is kept as a
+quick check. A directory accepts only one configuration, and reruns skip the searches whose
 result file exists, so an interrupted campaign continues where it stopped. A data file is an
 `.npz` with `signal` of shape `(n_channels, N)` and `dt`, listed in `inputs.data`.
 

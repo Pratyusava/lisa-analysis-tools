@@ -273,7 +273,9 @@ class FEWHarmonicTrackModel(LISAToolsParallelModule):
         return Track(w @ f, w @ fdot, w @ fddot)
 
 
-def few_track_bank(prior, n_tracks, t_alpha, T_ref, seed=None, m=2, n=0, err=1e-11, max_draws=None):
+def few_track_bank(
+    prior, n_tracks, t_alpha, T_ref, seed=None, m=2, n=0, err=1e-11, max_draws=None, n_workers=1
+):
     """A bank of FEW harmonic tracks plunging at ``T_ref``, for :meth:`SVDBasis.build`.
 
     Draws ``(log10 m1, m2, a, e_f)`` uniformly in ``prior`` (a dict of
@@ -294,13 +296,13 @@ def few_track_bank(prior, n_tracks, t_alpha, T_ref, seed=None, m=2, n=0, err=1e-
         T_ref: Plunge time of every track [s].
         seed: Seed of the draws.
         m, n, err: Harmonic and integrator tolerance (:class:`FEWHarmonicTrackModel`).
+        n_workers: Processes the FEW integrations run in (~0.02 s each). The bank is the
+            same for every ``n_workers``.
 
     Returns:
         A :class:`TrackBank`: ``f`` and ``fdot``, shape ``(n_tracks, len(t_alpha))``,
         and the kept draws ``params``, shape ``(n_tracks, 4)``.
     """
-    from ...utils.constants import YRSID_SI
-
     keys = ("log10_m1", "m2", "a", "e_f")
     lo = np.array([prior[k][0] for k in keys], dtype=float)
     hi = np.array([prior[k][1] for k in keys], dtype=float)
@@ -310,28 +312,97 @@ def few_track_bank(prior, n_tracks, t_alpha, T_ref, seed=None, m=2, n=0, err=1e-
     model = FEWHarmonicTrackModel(t_alpha, m=m, n=n, err=err)
     rng = np.random.default_rng(seed)
     max_draws = 20 * n_tracks if max_draws is None else int(max_draws)
+
+    # The draws come from rng one at a time, in the same order whatever n_workers is, and are
+    # accepted in that order: the bank does not depend on how the integrations are spread.
     tracks, fdots, params, draws = [], [], [], 0
-    while len(tracks) < n_tracks:
-        if draws >= max_draws:
-            raise RuntimeError(
-                f"{len(tracks)} of {n_tracks} tracks after {draws} draws: the prior rarely "
-                f"gives inspirals that last {T_ref / YRSID_SI:.3g} yr."
-            )
-        draws += 1
-        log10_m1, m2, a, e_f = rng.uniform(lo, hi)
-        try:
-            track = model((10**log10_m1, m2, a, T_ref / YRSID_SI, e_f))
-        except Exception:  # FEW cannot integrate this draw back to t_alpha[0]
-            continue
-        f, fdot = np.array(track.f), np.array(track.fdot)
-        if f[0] == 0.0:  # the inspiral is shorter than the grid
-            continue
-        f[incomplete] = 0.0
-        fdot[incomplete] = 0.0
-        tracks.append(f)
-        fdots.append(fdot)
-        params.append((log10_m1, m2, a, e_f))
+    with _BankIntegrator(model, T_ref, n_workers) as integrate:
+        while len(tracks) < n_tracks:
+            if draws >= max_draws:
+                raise _bank_exhausted(len(tracks), n_tracks, draws, T_ref)
+            batch = min(integrate.batch_size, max_draws - draws)
+            candidates = [rng.uniform(lo, hi) for _ in range(batch)]
+            draws += batch
+            for candidate, track in zip(candidates, integrate(candidates)):
+                if track is None or len(tracks) == n_tracks:
+                    continue
+                f, fdot = track
+                f[incomplete] = 0.0
+                fdot[incomplete] = 0.0
+                tracks.append(f)
+                fdots.append(fdot)
+                params.append(tuple(candidate))
     return TrackBank(np.array(tracks), np.array(fdots), np.array(params))
+
+
+def _bank_exhausted(n_kept, n_tracks, draws, T_ref):
+    from ...utils.constants import YRSID_SI
+
+    return RuntimeError(
+        f"{n_kept} of {n_tracks} tracks after {draws} draws: the prior rarely gives inspirals "
+        f"that last {T_ref / YRSID_SI:.3g} yr."
+    )
+
+
+class _BankIntegrator:
+    """Integrates bank draws ``(log10 m1, m2, a, e_f)`` into ``(f, fdot)``, or ``None`` when
+    FEW cannot integrate the draw back to the grid's start. Serial for ``n_workers = 1``,
+    otherwise in that many processes (each builds its own FEW trajectory)."""
+
+    BATCH_PER_WORKER = 16
+
+    def __init__(self, model, T_ref, n_workers=1):
+        self.model, self.T_ref, self.n_workers = model, float(T_ref), max(int(n_workers), 1)
+        self.batch_size = 1 if self.n_workers == 1 else self.BATCH_PER_WORKER * self.n_workers
+        self.pool = None
+
+    def __enter__(self):
+        if self.n_workers > 1:
+            import multiprocessing
+            from concurrent.futures import ProcessPoolExecutor
+
+            self.pool = ProcessPoolExecutor(
+                self.n_workers,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_set_bank_worker,
+                initargs=(self.model, self.T_ref),
+            )
+        return self
+
+    def __exit__(self, *exc):
+        if self.pool is not None:
+            self.pool.shutdown()
+
+    def __call__(self, candidates):
+        if self.pool is None:
+            return [_integrate_draw(self.model, self.T_ref, c) for c in candidates]
+        return list(self.pool.map(_bank_worker_draw, candidates, chunksize=4))
+
+
+_BANK_WORKER: dict = {}
+
+
+def _set_bank_worker(model, T_ref):
+    _BANK_WORKER.update(model=model, T_ref=T_ref)
+
+
+def _bank_worker_draw(candidate):
+    return _integrate_draw(_BANK_WORKER["model"], _BANK_WORKER["T_ref"], candidate)
+
+
+def _integrate_draw(model, T_ref, candidate):
+    """``(f, fdot)`` of one bank draw, or ``None`` when it is unusable."""
+    from ...utils.constants import YRSID_SI
+
+    log10_m1, m2, a, e_f = candidate
+    try:
+        track = model((10**log10_m1, m2, a, T_ref / YRSID_SI, e_f))
+    except Exception:  # FEW cannot integrate this draw back to t_alpha[0]
+        return None
+    f, fdot = np.array(track.f), np.array(track.fdot)
+    if f[0] == 0.0:  # the inspiral is shorter than the grid
+        return None
+    return f, fdot
 
 
 def kerr_ecc_eq_inspiral():

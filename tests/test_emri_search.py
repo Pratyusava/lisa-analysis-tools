@@ -640,6 +640,27 @@ class SVDBasisBuildTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             few_track_bank(prior, 3, t, T_ref, seed=5, max_draws=0)
 
+    def test_parallel_bank_is_the_serial_bank(self):
+        try:
+            import few  # noqa: F401
+        except ImportError:  # pragma: no cover
+            raise unittest.SkipTest("FEW not installed")
+        from unittest import mock
+
+        from lisatools.search.emri import few_track_bank, tracks
+        from lisatools.search.emri.injection import TABLE1_PRIOR
+
+        # over 100 yr FEW cannot integrate some Table 1 draws back (draws 0 and 3 at seed 3),
+        # so the parallel bank must keep the same draws in the same order to match
+        T_ref = 100 * YRSID_SI
+        t = np.arange(0.0, T_ref, 2e6)
+        with mock.patch.object(tracks, "_integrate_draw", wraps=tracks._integrate_draw) as draw:
+            serial = few_track_bank(TABLE1_PRIOR, 12, t, T_ref, seed=3)
+        self.assertGreater(draw.call_count, 12)  # the test covers rejected draws
+        parallel = few_track_bank(TABLE1_PRIOR, 12, t, T_ref, seed=3, n_workers=2)
+        for name in ("f", "fdot", "params"):
+            np.testing.assert_array_equal(getattr(parallel, name), getattr(serial, name))
+
 
 class ChebyshevTest(unittest.TestCase):
     """Cutler & Bustamante-Rosell's Chebyshev phase model as a track model."""
@@ -1585,6 +1606,78 @@ def store_by_n(records, label, n_seg=None):
     return next(r["best_statistic"] for n, r in recs if n == n_seg)
 
 
+class MismatchTest(unittest.TestCase):
+    """The track mismatch: the ruler on a chirp, and the basis / search split."""
+
+    def setUp(self):
+        self.psd = constant_psd()
+        self.track = chirp_track(f0=3e-3, fdot=2.5e-11)
+        self.signal = chirp_timeseries(self.track, 1.0)[None, :]
+
+    def offset(self, track, bins):
+        return Track(track.f + bins / T_SFT, track.fdot)
+
+    def mismatch(self, found, coherence=1):
+        from lisatools.search.emri.mismatch import semi_coherent_power
+
+        def power(track):
+            return semi_coherent_power(self.signal, track, DT, T_SFT, self.psd, coherence)
+
+        return 1.0 - power(found) / power(self.track)
+
+    def test_ruler_on_a_chirp(self):
+        # a constant frequency offset of d bins keeps sinc^2(k d) of each coherent segment
+        self.assertAlmostEqual(self.mismatch(self.track), 0.0, places=12)
+        for bins in (0.1, 0.5):
+            want = 1.0 - np.sinc(bins) ** 2
+            self.assertAlmostEqual(self.mismatch(self.offset(self.track, bins)), want, delta=1e-2)
+        found = self.offset(self.track, 0.1)
+        by_coherence = [self.mismatch(found, k) for k in (1, 2, 4)]
+        for k, value in zip((1, 2, 4), by_coherence):
+            self.assertAlmostEqual(value, 1.0 - np.sinc(0.1 * k) ** 2, delta=1e-2)
+        self.assertEqual(by_coherence, sorted(by_coherence))
+
+    def test_chunks_do_not_change_the_power(self):
+        from unittest import mock
+
+        from lisatools.search.emri import mismatch
+
+        found = self.offset(self.track, 0.3)
+        whole = mismatch.semi_coherent_powers(self.signal, found, DT, T_SFT, self.psd, (1, 2, 4))
+        with mock.patch.object(mismatch, "CHUNK_SEGMENTS", 5):
+            chunked = mismatch.semi_coherent_powers(
+                self.signal, found, DT, T_SFT, self.psd, (1, 2, 4)
+            )
+        for k in (1, 2, 4):
+            self.assertAlmostEqual(chunked[k] / whole[k], 1.0, places=12)
+
+    def test_track_phase_is_continuous(self):
+        from lisatools.search.emri.mismatch import track_phase
+
+        phase, valid = track_phase(self.track, N_SEG, int(T_SFT / DT), DT)
+        t = np.arange(N_SEG * int(T_SFT / DT)) * DT
+        want = 2 * np.pi * (self.track.f[0] * t + 0.5 * self.track.fdot[0] * t**2)
+        wrapped = np.angle(np.exp(1j * (phase.ravel() - want)))
+        self.assertLess(np.max(np.abs(wrapped)), 1e-6)
+        self.assertTrue(valid.all())
+
+    def test_chebyshev_projection_recovers_a_model_track(self):
+        from lisatools.search.emri import ChebyshevBasis, ChebyshevTrackModel
+        from lisatools.search.emri.mismatch import best_representable
+
+        lb = np.array([8.0, -0.5, -0.3, -0.2, -0.1])
+        ub = np.array([11.0, 0.5, 0.3, 0.2, 0.1])
+        basis = ChebyshevBasis(lb, ub, band=(3e-3, 8e-3))
+        t = np.arange(N_SEG) * T_SFT
+        model = ChebyshevTrackModel(basis, t, T_ref=N_SEG * T_SFT, force_backend="cpu")
+        true = model(model.unit(np.array([10.0, 0.1, -0.05, 0.02, 0.0]), 0.3))
+        self.assertTrue(np.all(true.f > 0))
+        candidates, in_box = best_representable(model, true, 0)
+        self.assertTrue(in_box)
+        for fitted in candidates:  # the linear fit and its refinement
+            self.assertLess(np.max(np.abs(fitted.f - true.f)) * T_SFT, 0.05)  # bins
+
+
 CAMPAIGN_TOML = """
 out = "campaign"
 n_workers = 1
@@ -1937,6 +2030,50 @@ class CampaignTest(unittest.TestCase):
         self.assertEqual(false_alarm_rate(10.0, [1.0, 5.0, 9.0]), 0.0)
         self.assertTrue(np.isnan(false_alarm_rate(1.0, [])))
 
+    def test_mismatch_split(self):
+        from lisatools.search.emri.mismatch import mismatch_columns
+
+        def record(track, n_seg):
+            return dict(
+                label="inj_000",
+                n_seg=n_seg,
+                shift=n_seg - N_SEG,
+                best_f=track.f[:n_seg],
+                best_fdot=track.fdot[:n_seg],
+                best_x=np.zeros(3),
+                best_statistic=1.0,
+                truth={},
+            )
+
+        harmonics = {2: self.track, 3: Track(1.5 * self.track.f, 1.5 * self.track.fdot)}
+        found = Track(self.track.f + 0.5 / T_SFT, self.track.fdot)
+        results = {12: record(found, 12), N_SEG: record(found, N_SEG)}
+
+        def columns(duration):
+            return mismatch_columns(
+                self.config, results, duration, self.injection.signal, true_tracks=harmonics
+            )
+
+        full = columns(N_SEG)
+        self.assertEqual(full["harmonic"], 2.0)
+        self.assertLess(abs(full["mismatch_basis"]), 1e-3)  # a linear chirp of the bank
+        self.assertAlmostEqual(full["mismatch"], 1.0 - np.sinc(0.5) ** 2, delta=1e-2)
+        self.assertAlmostEqual(
+            1.0 - full["mismatch"],
+            (1.0 - full["mismatch_basis"]) * (1.0 - full["mismatch_search"]),
+            places=12,
+        )
+        self.assertTrue({"mismatch_x2", "mismatch_x4"} <= set(full))
+        # a track found on half the stream is charged for the half it misses
+        half = columns(12)
+        self.assertAlmostEqual(1.0 - half["mismatch"], 0.5 * (1.0 - full["mismatch"]), delta=0.05)
+        self.assertAlmostEqual(half["mismatch_basis"], full["mismatch_basis"], places=6)
+        # without the basis file only the split is missing
+        os.remove(self.config.basis.file)
+        without_basis = columns(N_SEG)
+        self.assertAlmostEqual(without_basis["mismatch"], full["mismatch"], places=12)
+        self.assertTrue(np.isnan(without_basis["mismatch_basis"]))
+
     def test_campaign(self):
         if not HAVE_JAX:
             raise unittest.SkipTest("JAX not installed")
@@ -2000,6 +2137,10 @@ class CampaignTest(unittest.TestCase):
             {"detected_0.5", "detected_0.01", "detected_0.0001"},
         )
         self.assertTrue(np.isnan(row["agreement"]) or 0.0 <= row["agreement"] <= 1.0)
+        if "mismatch" in row:  # FEW gave the true track (of the recorded source, not the toy chirp)
+            cached = os.listdir(os.path.join(out, "mismatch"))
+            self.assertEqual(cached, [f"inj_000_n{row['duration']:04d}.json"])
+        self.assertEqual(inj["best_fdot"].shape, (24,))
         self.assertEqual(bg.durations, [12, 24])
         self.assertEqual(summary["noise_lambda"].shape, (3,))
         self.assertTrue(os.path.exists(os.path.join(out, "summary.csv")))
@@ -2008,7 +2149,10 @@ class CampaignTest(unittest.TestCase):
         reopened = ResultStore(out)
         self.assertEqual(reopened.config, self.config)
         self.assertEqual(reopened.fingerprint, store.fingerprint)
-        self.assertEqual(len(run.run(["collect"], log=logs.append)["rows"]), 1)
+        # (the mismatch comes from the cache: FEW, unmocked here, is not called)
+        rows = run.run(["collect"], log=logs.append)["rows"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].get("mismatch"), row.get("mismatch"))
 
 
 if __name__ == "__main__":

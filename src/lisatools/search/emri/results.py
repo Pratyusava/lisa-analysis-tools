@@ -6,7 +6,7 @@
   which put every duration on one scale (Speri et al., Sec. III.1).
 - :func:`collect`: the summary table. Each stream's detection statistic, its false-alarm
   rate against the background, the detections at the chosen false-alarm probabilities, and
-  how well the best track follows the injected one.
+  how well the best track follows the injected one (:mod:`.mismatch`).
 """
 
 from __future__ import annotations
@@ -17,11 +17,12 @@ import json
 import os
 import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 from .config import SearchConfig
+from .mismatch import DEFAULT_COHERENCE, basis_available, cached_mismatch_columns, mismatch_columns
 from .pipeline import SearchResult
 
 SOURCE_COLUMNS = ("m1", "m2", "a", "T_pl", "e_f")
@@ -125,6 +126,7 @@ class ResultStore:
             best_statistic=float(result.best_statistic),
             best_x=np.asarray(result.best_x),
             best_f=np.asarray(result.best_track.f),  # type: ignore[attr-defined]
+            best_fdot=np.asarray(result.best_track.fdot),  # type: ignore[attr-defined]
             iterations=int(history.get("last_step", self.config.optimizer.n_steps)),
             truth=json.dumps(info.truth or {}),
             noise_seed=-1 if info.noise_seed is None else int(info.noise_seed),
@@ -235,7 +237,14 @@ class Background:
 
 
 # ----------------------------------------------------------------------------- the summary
-def collect(store: ResultStore, tol_bins=2.0, p_fa=(0.5, 1e-2, 1e-4), log=print) -> Dict[str, Any]:
+def collect(
+    store: ResultStore,
+    tol_bins=2.0,
+    p_fa=(0.5, 1e-2, 1e-4),
+    log=print,
+    signals: Optional[Mapping[str, Callable[[], np.ndarray]]] = None,
+    coherence: Sequence[int] = DEFAULT_COHERENCE,
+) -> Dict[str, Any]:
     """Summarise a campaign directory (the detection statistic: :class:`Background`).
 
     One row per injection or data stream, with the columns:
@@ -251,9 +260,19 @@ def collect(store: ResultStore, tol_bins=2.0, p_fa=(0.5, 1e-2, 1e-4), log=print)
                        probability in ``p_fa`` (paper: 0.5, 1e-2, 1e-4)
     ``agreement``      with FEW: fraction of the injected track's in-band segments
                        the best track follows within ``tol_bins`` bins
+    ``mismatch``       with the noiseless signal: ``1 - P(best track) / P(true
+                       track)`` at the peak duration (:mod:`.mismatch`)
+    ``harmonic``       the ``m`` of the true track (the one the best track is closest to)
+    ``mismatch_basis`` the same for the best track the basis can represent
+    ``mismatch_search`` the best track against that one
+    ``in_basis_box``   whether that track lies inside the basis box (1 / 0)
+    ``mismatch_x<k>``  ``mismatch`` with coherent segments of ``k`` SFT segments
     =================  ===========================================================
 
-    Durations the background does not cover are left out of ``Lambda``.
+    Durations the background does not cover are left out of ``Lambda``. ``signals`` maps an
+    injection's label to a function returning its noiseless signal (regenerated with FEW;
+    :meth:`~.campaign.RunConfig.run` passes them); streams without one get no mismatch
+    columns. The mismatches are cached in ``<out>/mismatch/``.
 
     Returns the rows and the background, and writes ``summary.csv`` and ``summary.npz``.
     """
@@ -278,6 +297,11 @@ def collect(store: ResultStore, tol_bins=2.0, p_fa=(0.5, 1e-2, 1e-4), log=print)
                 stacklevel=2,
             )
         else:
+            if signals and label in signals:
+                columns = _track_mismatch(
+                    store, results, row["duration"], signals[label], coherence, log
+                )
+                row.update(columns)
             rows.append(row)
 
     noise_lambda, location, scale = background.noise_lambda(background.durations)
@@ -372,6 +396,30 @@ def _agreement(config: SearchConfig, record, tol_bins) -> float:
     return float(np.mean(followed))
 
 
+def _track_mismatch(
+    store: ResultStore, results, duration, signal, coherence, log
+) -> Dict[str, float]:
+    """The mismatch columns of one stream at ``duration`` (cached), ``{}`` when they cannot
+    be computed."""
+
+    def compute():
+        log(f"mismatch of {results[duration]['label']}: regenerating its signal")
+        return mismatch_columns(store.config, results, duration, signal(), coherence=coherence)
+
+    try:
+        return cached_mismatch_columns(
+            store.directory,
+            results[duration],
+            list(results),
+            compute,
+            coherence,
+            basis_available(store.config),
+        )
+    except Exception as exc:  # pragma: no cover - FEW missing or a failed integration
+        warnings.warn(f"no mismatch for {results[duration]['label']}: {exc}", stacklevel=2)
+        return {}
+
+
 def _write_summary(directory, rows, background: Background, noise_lambda, gumbel):
     arrays: Dict[str, Any] = dict(
         background_labels=np.array(background.labels),
@@ -383,7 +431,8 @@ def _write_summary(directory, rows, background: Background, noise_lambda, gumbel
         gumbel=np.array(gumbel),
     )
     if rows:
-        columns = list(rows[0])
+        columns = list(dict.fromkeys(column for row in rows for column in row))
+        rows = [{column: row.get(column, float("nan")) for column in columns} for row in rows]
         with open(os.path.join(directory, "summary.csv"), "w", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=columns)
             writer.writeheader()
@@ -407,9 +456,10 @@ def _log_summary(log, rows, background: Background, gumbel, p_fa: Sequence[float
         log(f"  threshold at p_FA = {p:g}: Lambda > {threshold:.2f}")
     for row in rows:
         far = f"{row['far']:.3f}" if np.isfinite(row["far"]) else "n/a"
-        agreement = f"{row['agreement']:.2f}" if np.isfinite(row["agreement"]) else "n/a"
+        mismatch = row.get("mismatch", float("nan"))
+        mismatch_text = f"{mismatch:.3f}" if np.isfinite(mismatch) else "n/a"
         log(
             f"  {row['label']:>24s}  {row['kind']:>9s}  Lambda {row['statistic']:7.2f} at n = "
             f"{row['duration']:4d}  FAR {far} (Gumbel {row['far_gumbel']:.1e})  "
-            f"agreement {agreement}"
+            f"mismatch {mismatch_text}"
         )

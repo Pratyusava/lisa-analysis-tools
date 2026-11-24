@@ -4,7 +4,7 @@
 #
 #   python emri_search.py configs/H_chebyshev.toml
 #
-# The first run builds the basis (bank.n_tracks FEW tracks, ~0.25 s each) and saves it to
+# The first run builds the basis (bank.n_tracks FEW tracks, ~0.02 s each) and saves it to
 # <out>/basis.npz; later runs load it. Another campaign can reuse it with
 # basis.source = "file" and basis.file = "../runs/H_chebyshev/basis.npz".
 # Only the tables this search uses are listed; reference.toml has every setting.
@@ -13,6 +13,7 @@ out = "../runs/H_chebyshev"
 n_workers = 4
 tol_bins = 2.0
 p_fa = [0.5, 1e-2, 1e-4]
+coherence = [1, 2, 4]
 
 [inputs]
 injections = ["../inj/*.json"]
@@ -51,7 +52,7 @@ min_span = 1.9            # draft: a bank track enters the box when its fit cove
 box_scale = 1.0           # draft: 1 (catalogue box) or 10 (wide box)
 
 [basis.bank]
-n_tracks = 10_000         # PAPER: 10^4 (~0.25 s per track)
+n_tracks = 10_000         # PAPER: 10^4 (~0.02 s per track: ~4 min)
 seed = 2601               # REPO
 
 [basis.bank.prior]        # PAPER Table 1, uniform

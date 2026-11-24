@@ -248,8 +248,10 @@ class FEWInjector:
     """FEW Kerr eccentric equatorial injections with LAT's TDI response.
 
     The response generator is built on first use and cached process-wide by
-    :func:`~lisatools.sources.emri.response.get_emri_response_wrapper` (one
-    generator is ~2.3 GiB on CPU); it is not pickled.
+    :func:`~lisatools.sources.emri.response.get_emri_response_wrapper`; it is not pickled.
+    On CPU at 1 yr and dt = 5 s one generator holds ~7.6 GB (5.5 GB of it FEW's
+    ``FastKerrEccentricEquatorialFlux``, the rest the response) and peaks at ~10 GB while
+    generating, so a process that injects needs ~10 GB.
 
     Args:
         T: Duration of the generated signal [yr] (EMRI-Search's ``T_snr``).

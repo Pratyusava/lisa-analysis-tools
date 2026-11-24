@@ -72,6 +72,9 @@ class RunConfig:
         n_workers: Processes the searches run in.
         tol_bins: Localisation tolerance of :func:`~.results.collect` [bins].
         p_fa: False-alarm probabilities of the detection thresholds (paper: 0.5, 1e-2, 1e-4).
+        coherence: Coherent segments [SFT segments] the track mismatch of
+            :func:`~.results.collect` is computed over (:mod:`.mismatch`); 1 is always
+            included.
         inputs: What is searched.
         search: Everything else in the file (:class:`~.config.SearchConfig`).
 
@@ -83,11 +86,12 @@ class RunConfig:
     n_workers: int = 1
     tol_bins: float = 2.0
     p_fa: Tuple[float, ...] = (0.5, 1e-2, 1e-4)
+    coherence: Tuple[int, ...] = (1, 2, 4)
     inputs: InputSettings = field(default_factory=InputSettings)
     search: SearchConfig = field(default_factory=SearchConfig)
 
     # the top-level keys that belong to the run; every other key is a SearchConfig table
-    RUN_KEYS = ("out", "n_workers", "tol_bins", "p_fa", "inputs")
+    RUN_KEYS = ("out", "n_workers", "tol_bins", "p_fa", "coherence", "inputs")
 
     # -- reading the file
     @classmethod
@@ -212,10 +216,10 @@ class RunConfig:
             raise ValueError(f"unknown stage(s) {sorted(unknown)}; known: {STAGES}.")
 
         if set(stages) == {"collect"}:  # needs only the campaign directory
-            return collect(ResultStore(self.out), self.tol_bins, self.p_fa, log=log)
+            return self.collect(ResultStore(self.out), log)
 
         self.check_inputs()
-        self.search.prepare_basis(log=log)
+        self.search.prepare_basis(log=log, n_workers=self.n_workers)
         store = ResultStore(self.out, self.search)
         log(
             f"configuration {store.fingerprint} in {self.out}: statistic "
@@ -231,8 +235,18 @@ class RunConfig:
             )
             log(f"background: {n_done} searches done")
         if "collect" in stages:
-            return collect(store, self.tol_bins, self.p_fa, log=log)
+            return self.collect(store, log)
         return None
+
+    def collect(self, store: ResultStore, log=print) -> Dict[str, Any]:
+        """The summary, with the track mismatch of every injection file still at hand."""
+        signals = {}
+        for path in self.injection_paths(required=False):
+            recipe = InjectionFile.load(path)
+            signals[recipe.label] = functools.partial(recipe.signal, path)
+        return collect(
+            store, self.tol_bins, self.p_fa, log=log, signals=signals, coherence=self.coherence
+        )
 
 
 def _matching_files(setting, patterns, required=True) -> List[str]:
